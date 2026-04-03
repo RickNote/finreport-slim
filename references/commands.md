@@ -1,13 +1,13 @@
 # finreport-slim 命令参数参考
 
-项目路径：`/Users/rick/Library/CloudStorage/OneDrive-个人/ProgramLibrary/finreport_scope/`
+脚本路径：`<skill_dir>/scripts/`（`<skill_dir>` 为本 skill 根目录）
 
 ---
 
-## convert 命令（PDF 转换，通过 scripts/convert.py 调用）
+## convert 命令（PDF 转换）
 
 ```bash
-python3 scripts/convert.py "<pdf_path>" "<output_root>" [options]
+python3 <skill_dir>/scripts/convert.py "<pdf_path>" "<output_root>" [options]
 ```
 
 | 参数 | 默认值 | 说明 | 何时修改 |
@@ -40,7 +40,7 @@ python3 scripts/convert.py "<pdf_path>" "<output_root>" [options]
 ## extract-theme 命令（主题命中页提取）
 
 ```bash
-python3 finreport_scope.py extract-theme \
+python3 <skill_dir>/scripts/finreport_scope.py extract-theme \
   --pages-json "<stem>.pages.json" \
   --output-dir "<output_dir>" \
   --theme <theme-name>
@@ -70,7 +70,7 @@ python3 finreport_scope.py extract-theme \
 ## slim 命令（生成 LLM 精简文档）
 
 ```bash
-python3 finreport_scope.py slim \
+python3 <skill_dir>/scripts/finreport_scope.py slim \
   --pages-json "<stem>.pages.json" \
   --theme-json "<stem>.<theme_slug>.json" \
   --output-dir "<output_dir>"
