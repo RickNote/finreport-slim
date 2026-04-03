@@ -87,18 +87,6 @@ python3 <skill_dir>/scripts/finreport_scope.py slim \
 
 ---
 
-## locate / build-records 命令（旧式精确提取，一般不用）
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--max-note-chars` | `4000` | 每条附注最多保留字符数 |
-| `--max-rows-per-item` | `12` | 每个主表项最多匹配附注表格行数 |
-| `--max-policy-sentences` | `8` | 每个主表项最多保留口径句子数 |
-
-使用 `slim` + LLM 方案后基本不再需要这些命令。
-
----
-
 ## 主题管理（themes.py）
 
 **文件路径**：`<skill_dir>/scripts/themes.py`，与 `finreport_scope.py` 同目录。
