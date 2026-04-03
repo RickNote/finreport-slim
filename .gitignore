@@ -1,2 +1,4 @@
 config.env
+scripts/themes.py
 .DS_Store
+__pycache__/

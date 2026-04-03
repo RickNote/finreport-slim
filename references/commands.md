@@ -101,9 +101,9 @@ python3 finreport_scope.py slim \
 
 ## 主题管理（themes.py）
 
-**文件路径**：放置于 `finreport_scope` 项目根目录，与 `finreport_scope.py` 同级。
+**文件路径**：`<skill_dir>/scripts/themes.py`，与 `finreport_scope.py` 同目录。
 
-**格式参考**：见 [themes.example.py](themes.example.py)
+**格式参考**：见 `scripts/themes.example.py`
 
 新增主题只需在 `THEME_PRESETS` 字典中添加一个条目：
 
