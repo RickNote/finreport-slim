@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import time
 import tempfile
 import zipfile
 from collections import defaultdict
+from html.parser import HTMLParser
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -84,14 +86,221 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _collapse_spaced_number(text: str) -> str:
+    collapsed = re.sub(r"(?<=\d)\s+(?=[\d.%])", "", text)
+    return re.sub(r"(?<=\.)\s+(?=\d)", "", collapsed)
+
+
+def _collapse_spaced_ascii_token(text: str) -> str:
+    return re.sub(
+        r"(?<![A-Za-z])(?:[A-Za-z]\s+){1,5}[A-Za-z](?![A-Za-z])",
+        lambda match: re.sub(r"\s+", "", match.group(0)),
+        text,
+    )
+
+
+def _normalize_formula_fragment(fragment: str) -> str:
+    normalized = fragment.strip()
+    normalized = normalized.replace(r"\%", "%")
+    normalized = normalized.replace(r"\cdot", "·")
+    normalized = normalized.replace(r"\times", "x")
+    normalized = re.sub(r"\\\^\s*\{\s*\+\s*\}", "+", normalized)
+    normalized = re.sub(r"\\\^\s*\+", "+", normalized)
+    normalized = re.sub(r"\^\s*\{\s*\+\s*\}", "+", normalized)
+    normalized = re.sub(r"\^\s*\+", "+", normalized)
+    normalized = re.sub(r"\\(?:mathsf|mathrm|text|operatorname)\s*", "", normalized)
+    normalized = normalized.replace("{", " ").replace("}", " ")
+    normalized = normalized.replace("\\", "")
+    normalized = _collapse_spaced_number(normalized)
+    normalized = _collapse_spaced_ascii_token(normalized)
+    normalized = re.sub(r"\s+([%.,;:])", r"\1", normalized)
+    normalized = re.sub(r"([(\"“])\s+", r"\1", normalized)
+    normalized = re.sub(r"\s+([)\"”])", r"\1", normalized)
+    normalized = re.sub(r"\s{2,}", " ", normalized)
+    return normalized.strip()
+
+
+def _clean_special_symbols(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = re.sub(r"\$\s*\\cdot\s*\$", "- ", cleaned)
+    cleaned = re.sub(
+        r"\$(.+?)\$",
+        lambda match: _normalize_formula_fragment(match.group(1)),
+        cleaned,
+        flags=re.DOTALL,
+    )
+    cleaned = _collapse_spaced_number(cleaned)
+    cleaned = re.sub(r"\s+([%.,;:])", r"\1", cleaned)
+    cleaned = re.sub(r"\(\s+", "(", cleaned)
+    cleaned = re.sub(r"\s+\)", ")", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _polish_readability(text: str) -> str:
+    polished_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("|") and line.endswith("|"):
+            polished_lines.append(line)
+            continue
+        line = re.sub(r"(?<=\d)%\s+([，。；：])", r"%\1", line)
+        line = re.sub(r"(?<=\d)\s+([，。；：])", r"\1", line)
+        line = re.sub(r"([（(])\s+", r"\1", line)
+        line = re.sub(r"\s+([）)])", r"\1", line)
+        line = re.sub(r"(?<=\S)\s{2,}", " ", line)
+        if line.startswith("-  "):
+            line = "- " + line[3:]
+        polished_lines.append(line)
+    polished = "\n".join(polished_lines)
+    polished = re.sub(r"\n{3,}", "\n\n", polished)
+    return polished.strip()
+
+
+# ---------------------------------------------------------------------------
+# Footer / header noise filtering
+# ---------------------------------------------------------------------------
+
+# Generic patterns that match across any annual report
+_FOOTER_GENERIC_RE: list[re.Pattern[str]] = [
+    re.compile(r"^\d{1,4}$"),                                  # page number
+    re.compile(r"^二零[二三四五六七八九零〇]+年年报$"),          # 二零二五年年报
+    re.compile(r"^20\d{2}年年度报告$"),                         # 2025年年度报告
+    re.compile(r"^关于我们$"),
+    re.compile(r"^财务报表$"),
+    re.compile(r"^审计报告$"),
+]
+
+
+def _build_footer_noise_set(pages: list[dict[str, Any]]) -> set[str]:
+    """Auto-detect report-specific footer noise strings from the first pages.
+
+    Scans the first ~10 pages for standalone company-name lines
+    (ending with 股份有限公司 or 有限公司) and adds both bracket variants.
+    """
+    noise: set[str] = set()
+    for page in pages[:10]:
+        for line in str(page.get("text", "")).splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if 4 <= len(stripped) <= 40 and re.fullmatch(
+                r".+(?:股份有限公司|有限公司)", stripped
+            ):
+                noise.add(stripped)
+                noise.add(stripped.replace("（", "(").replace("）", ")"))
+                noise.add(stripped.replace("(", "（").replace(")", "）"))
+    return noise
+
+
+def _is_footer_noise_line(
+    line: str, extra_noise: set[str] | None = None
+) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    # Generic patterns
+    for pat in _FOOTER_GENERIC_RE:
+        if pat.fullmatch(stripped):
+            return True
+    # Report-specific noise (auto-detected company name etc.)
+    if extra_noise and stripped in extra_noise:
+        return True
+    return False
+
+
+def _looks_like_short_footer_garble(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("|"):
+        return False
+    if len(stripped) > 14:
+        return False
+    if re.search(r"[，。；：？！,.%()（）]", stripped):
+        return False
+    if re.search(r"[A-Za-z]{3,}", stripped):
+        return False
+    return True
+
+
+_FOOTER_SCAN_DEPTH = 8
+
+
+def _strip_footer_noise(
+    text: str, extra_noise: set[str] | None = None
+) -> str:
+    lines = str(text or "").splitlines()
+    if not lines:
+        return ""
+
+    tail_start = max(0, len(lines) - _FOOTER_SCAN_DEPTH)
+
+    # Pre-check: is there any real footer noise (non-blank) in the tail?
+    has_footer = any(
+        lines[j].strip()
+        and _is_footer_noise_line(lines[j], extra_noise)
+        for j in range(tail_start, len(lines))
+    )
+    if not has_footer:
+        return text
+
+    # Scan from bottom; since we know there IS footer noise in the tail,
+    # treat both noise lines and short garble lines as removable.
+    i = len(lines) - 1
+    while i >= tail_start:
+        line = lines[i].rstrip()
+        if _is_footer_noise_line(line, extra_noise):
+            i -= 1
+            continue
+        if _looks_like_short_footer_garble(line):
+            i -= 1
+            continue
+        break
+
+    return "\n".join(lines[: i + 1]).strip()
+
+
+def _strip_header_noise(
+    text: str, extra_noise: set[str] | None = None
+) -> str:
+    """Remove noise lines from the top of a page (mirrored footer logic)."""
+    lines = str(text or "").splitlines()
+    if not lines:
+        return ""
+
+    head_end = min(len(lines), _FOOTER_SCAN_DEPTH)
+
+    has_noise = any(
+        lines[j].strip()
+        and _is_footer_noise_line(lines[j], extra_noise)
+        for j in range(head_end)
+    )
+    if not has_noise:
+        return text
+
+    i = 0
+    while i < head_end:
+        line = lines[i].rstrip()
+        if _is_footer_noise_line(line, extra_noise):
+            i += 1
+            continue
+        if _looks_like_short_footer_garble(line):
+            i += 1
+            continue
+        break
+
+    return "\n".join(lines[i:]).strip()
+
+
 def _extract_text_from_item(item: dict[str, Any]) -> str:
     for key in ("text", "table_body", "code_body"):
         value = item.get(key)
         if value:
-            return str(value).strip()
+            return _polish_readability(_clean_special_symbols(str(value).strip()))
     list_items = item.get("list_items") or []
     if list_items:
-        return "\n".join(str(x) for x in list_items).strip()
+        return _polish_readability(
+            _clean_special_symbols("\n".join(str(x) for x in list_items).strip())
+        )
     return ""
 
 
@@ -410,7 +619,7 @@ def _normalize_item_name(text: str) -> str:
 
 
 def _clean_note_text(text: str) -> str:
-    cleaned = text
+    cleaned = _clean_special_symbols(text)
     cleaned = re.sub(
         r"\n?财务报表\s*\n?二零二五年年报\s*\n?中国平安保险（集团）股份有限公司\s*\n?",
         "\n",
@@ -1102,47 +1311,170 @@ def extract_theme_hits(args: argparse.Namespace) -> None:
     )
 
 
-def _html_table_to_markdown(html: str) -> str:
+def _html_table_to_markdown(table_html: str) -> str:
     """Convert an HTML table to standard Markdown table format."""
-    # Extract rows
-    row_chunks = re.split(r"</tr>", html, flags=re.IGNORECASE)
-    rows: list[list[str]] = []
-    for chunk in row_chunks:
-        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", chunk, flags=re.DOTALL | re.IGNORECASE)
-        cleaned = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
-        cleaned = [c for c in cleaned if c]
-        if cleaned:
-            rows.append(cleaned)
 
-    if not rows:
+    class TableParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[list[dict[str, Any]]] = []
+            self._in_row = False
+            self._in_cell = False
+            self._current_row: list[dict[str, Any]] = []
+            self._current_cell: dict[str, Any] | None = None
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attrs_map = dict(attrs)
+            if tag == "tr":
+                self._in_row = True
+                self._current_row = []
+                return
+            if tag in {"td", "th"} and self._in_row:
+                self._in_cell = True
+                self._current_cell = {
+                    "text": "",
+                    "rowspan": max(1, int(attrs_map.get("rowspan") or "1")),
+                    "colspan": max(1, int(attrs_map.get("colspan") or "1")),
+                    "is_header": tag == "th",
+                }
+                return
+            if self._in_cell and tag == "br" and self._current_cell is not None:
+                self._current_cell["text"] += "\n"
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in {"td", "th"} and self._in_cell and self._current_cell is not None:
+                self._current_cell["text"] = _clean_special_symbols(
+                    html.unescape(self._current_cell["text"]).strip()
+                )
+                self._current_row.append(self._current_cell)
+                self._current_cell = None
+                self._in_cell = False
+                return
+            if tag == "tr" and self._in_row:
+                if self._current_row:
+                    self.rows.append(self._current_row)
+                self._current_row = []
+                self._in_row = False
+
+        def handle_data(self, data: str) -> None:
+            if self._in_cell and self._current_cell is not None:
+                self._current_cell["text"] += data
+
+    parser = TableParser()
+    parser.feed(table_html)
+    if not parser.rows:
         return ""
 
-    # Normalise column count
-    col_count = max(len(r) for r in rows)
-    padded = [r + [""] * (col_count - len(r)) for r in rows]
+    grid: list[list[str]] = []
+    spans: dict[int, tuple[int, str]] = {}
+    max_cols = 0
 
-    # Build markdown lines
+    for row_cells in parser.rows:
+        row: list[str] = []
+        col_idx = 0
+
+        def flush_spans() -> None:
+            nonlocal col_idx
+            while col_idx in spans:
+                remaining, value = spans[col_idx]
+                row.append(value)
+                if remaining <= 1:
+                    del spans[col_idx]
+                else:
+                    spans[col_idx] = (remaining - 1, value)
+                col_idx += 1
+
+        flush_spans()
+        for cell in row_cells:
+            flush_spans()
+            text = str(cell["text"]).replace("|", "\\|")
+            colspan = int(cell["colspan"])
+            rowspan = int(cell["rowspan"])
+            for offset in range(colspan):
+                value = text if offset == 0 else ""
+                row.append(value)
+                if rowspan > 1:
+                    spans[col_idx] = (rowspan - 1, value)
+                col_idx += 1
+            flush_spans()
+        flush_spans()
+        max_cols = max(max_cols, len(row))
+        grid.append(row)
+
+    if max_cols == 0:
+        return ""
+
+    padded = [row + [""] * (max_cols - len(row)) for row in grid]
+
     def md_row(cells: list[str]) -> str:
         return "| " + " | ".join(cells) + " |"
 
-    lines = [md_row(padded[0])]
-    lines.append("|" + "|".join("---" for _ in range(col_count)) + "|")
-    for row in padded[1:]:
-        lines.append(md_row(row))
-    return "\n".join(lines)
+    header = padded[0]
+    separator = "|" + "|".join("---" for _ in range(max_cols)) + "|"
+    body = padded[1:]
+
+    def is_section_row(cells: list[str]) -> bool:
+        if not cells:
+            return False
+        first = cells[0].strip()
+        rest = [cell.strip() for cell in cells[1:]]
+        return bool(first) and not any(rest)
+
+    section_row_count = sum(1 for row in body if is_section_row(row))
+    if section_row_count < 2:
+        # Need at least 2 section rows to justify splitting; a single one
+        # is more likely a data row that happens to have empty trailing cols.
+        lines = [md_row(header), separator]
+        for row in body:
+            lines.append(md_row(row))
+        return "\n".join(lines)
+
+    blocks: list[str] = []
+    current_section: str | None = None
+    current_rows: list[list[str]] = []
+
+    def flush_current_rows() -> None:
+        nonlocal current_rows
+        if not current_rows:
+            return
+        lines = []
+        if current_section:
+            lines.append(f"**{current_section}**")
+        lines.append(md_row(header))
+        lines.append(separator)
+        for row in current_rows:
+            lines.append(md_row(row))
+        blocks.append("\n".join(lines))
+        current_rows = []
+
+    for row in body:
+        if is_section_row(row):
+            flush_current_rows()
+            current_section = row[0].strip()
+            continue
+        current_rows.append(row)
+
+    flush_current_rows()
+    return "\n\n".join(blocks)
 
 
-def _clean_page_for_llm(page: dict[str, Any]) -> str:
+def _clean_page_for_llm(
+    page: dict[str, Any], footer_noise: set[str] | None = None
+) -> str:
     """Return LLM-ready text for a page: HTML tables become standard Markdown tables."""
     text = page["text"]
     text = re.sub(
         r"<table.*?</table>",
-        lambda m: _html_table_to_markdown(m.group(0)),
+        lambda m: f"\n\n{_html_table_to_markdown(m.group(0))}\n\n",
         text,
         flags=re.DOTALL | re.IGNORECASE,
     )
     text = re.sub(r"<[^>]+>", "", text)
-    return text.strip()
+    text = _polish_readability(_clean_special_symbols(text))
+    text = _strip_header_noise(text, footer_noise)
+    text = _strip_footer_noise(text, footer_noise)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
 
 
 def slim_for_llm(args: argparse.Namespace) -> None:
@@ -1151,6 +1483,9 @@ def slim_for_llm(args: argparse.Namespace) -> None:
     pages = pages_payload["pages"]
     pages_map = {int(p["page_idx"]): p for p in pages}
     artifact_prefix = _derive_artifact_prefix(pages_json_path)
+
+    # Auto-detect report-specific footer noise (company name etc.)
+    footer_noise = _build_footer_noise_set(pages)
 
     theme_json_path = Path(args.theme_json).expanduser().resolve()
     theme_data = json.loads(theme_json_path.read_text(encoding="utf-8"))
@@ -1172,7 +1507,7 @@ def slim_for_llm(args: argparse.Namespace) -> None:
     for idx in selected_sorted:
         page = pages_map[idx]
         flag = " [hit]" if idx in hit_indices else ""
-        clean = _clean_page_for_llm(page)
+        clean = _clean_page_for_llm(page, footer_noise)
         if clean:
             chunks.append(f"<!-- page: {idx}{flag} -->\n{clean}")
 
