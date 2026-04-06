@@ -30,12 +30,6 @@ DEFAULT_NOTES_PATTERNS = [
     r"财务报表附注",
     r"Notes to the Financial Statements",
 ]
-STATEMENT_ROW_RE = re.compile(
-    r"<tr><td>([^<]+)</td><td>([^<]*)</td><td>([^<]*)</td><td>([^<]*)</td></tr>"
-)
-NOTE_HEADING_RE = re.compile(r"(?m)^(?P<note_no>\d{1,2})\.\s*(?P<title>[^\n（(]+)")
-TOP_LEVEL_HEADING_RE = re.compile(r"(?m)^[一二三四五六七八九十]+、[^\n]+")
-
 
 
 @dataclass
@@ -45,24 +39,6 @@ class PageRecord:
     markdown: str
     matched_tags: list[str]
 
-
-@dataclass
-class StatementRow:
-    page_idx: int
-    item_name: str
-    note_reference: str | None
-    current_period_amount: str | None
-    prior_period_amount: str | None
-
-
-@dataclass
-class NoteSection:
-    note_no: str
-    title: str
-    start_page_idx: int
-    end_page_idx: int
-    pages: list[int]
-    text: str
 
 
 @dataclass
@@ -489,10 +465,6 @@ def _derive_artifact_prefix(path: Path) -> str:
     name = path.name
     for suffix in [
         ".pages.json",
-        ".statement_rows.json",
-        ".note_sections.json",
-        ".statement_note_map.json",
-        ".records.json",
         ".candidates.json",
         ".md",
         ".json",
@@ -502,121 +474,6 @@ def _derive_artifact_prefix(path: Path) -> str:
     return path.stem
 
 
-def _parse_statement_rows(statement_pages: list[dict[str, Any]]) -> list[StatementRow]:
-    rows: list[StatementRow] = []
-    for page in statement_pages:
-        for item_name, note_ref, current_amt, prior_amt in STATEMENT_ROW_RE.findall(
-            page["text"]
-        ):
-            item_name = item_name.strip()
-            note_ref = note_ref.strip() or None
-            current_amt = current_amt.strip() or None
-            prior_amt = prior_amt.strip() or None
-            if not item_name:
-                continue
-            if item_name in {
-                "资产",
-                "负债",
-                "股东权益",
-                "负债及股东权益",
-                "金融投资：",
-            }:
-                continue
-            if not current_amt and not prior_amt:
-                continue
-            rows.append(
-                StatementRow(
-                    page_idx=int(page["page_idx"]),
-                    item_name=item_name,
-                    note_reference=note_ref,
-                    current_period_amount=current_amt,
-                    prior_period_amount=prior_amt,
-                )
-            )
-    return rows
-
-
-def _build_note_sections(notes_pages: list[dict[str, Any]]) -> list[NoteSection]:
-    matches: list[dict[str, Any]] = []
-    for page in notes_pages:
-        page_text = page["text"]
-        for match in NOTE_HEADING_RE.finditer(page_text):
-            title = match.group("title").strip(" ：:")
-            note_no = match.group("note_no")
-            if matches:
-                prev = matches[-1]
-                if (
-                    prev["note_no"] == note_no
-                    and _normalize_item_name(prev["title"]) == _normalize_item_name(title)
-                ):
-                    continue
-            matches.append(
-                {
-                    "note_no": note_no,
-                    "title": title,
-                    "page_idx": int(page["page_idx"]),
-                    "start": match.start(),
-                }
-            )
-
-    if not matches:
-        return []
-
-    page_map = {int(page["page_idx"]): page["text"] for page in notes_pages}
-    ordered_pages = sorted(page_map)
-    page_position = {page_idx: i for i, page_idx in enumerate(ordered_pages)}
-    sections: list[NoteSection] = []
-
-    for idx, current in enumerate(matches):
-        next_match = matches[idx + 1] if idx + 1 < len(matches) else None
-        start_page = current["page_idx"]
-        start_offset = current["start"]
-        if idx == 0 and ordered_pages[0] < start_page:
-            start_page = ordered_pages[0]
-            start_offset = 0
-        end_page = next_match["page_idx"] if next_match else ordered_pages[-1]
-        collected_pages: list[int] = []
-        text_chunks: list[str] = []
-
-        start_pos = page_position[start_page]
-        end_pos = page_position[end_page]
-        for pos in range(start_pos, end_pos + 1):
-            page_idx = ordered_pages[pos]
-            if pos > start_pos and ordered_pages[pos] != ordered_pages[pos - 1] + 1:
-                break
-            page_text = page_map[page_idx]
-            if page_idx == start_page and page_idx == end_page and next_match:
-                text_chunks.append(page_text[start_offset : next_match["start"]].strip())
-            elif page_idx == start_page:
-                text_chunks.append(page_text[start_offset:].strip())
-            elif next_match and page_idx == end_page:
-                text_chunks.append(page_text[: next_match["start"]].strip())
-            else:
-                text_chunks.append(page_text.strip())
-            collected_pages.append(page_idx)
-
-        section_text = "\n\n".join(chunk for chunk in text_chunks if chunk).strip()
-        section_text = _clean_note_text(section_text)
-        sections.append(
-            NoteSection(
-                note_no=current["note_no"],
-                title=current["title"],
-                start_page_idx=start_page,
-                end_page_idx=collected_pages[-1],
-                pages=collected_pages,
-                text=section_text,
-            )
-        )
-    return sections
-
-
-def _normalize_item_name(text: str) -> str:
-    normalized = text.strip()
-    normalized = normalized.replace("其中：", "")
-    normalized = normalized.replace("其中:", "")
-    normalized = re.sub(r"\s+", "", normalized)
-    normalized = normalized.strip("：:")
-    return normalized
 
 
 def _clean_note_text(text: str) -> str:
@@ -729,12 +586,16 @@ _TOC_OFFSET_ANCHORS: list[tuple[str, str]] = [
 ]
 
 
+_TOC_LINE_REVERSED_RE = re.compile(r"^(\d{1,4})\s+(.{2,60}?)\s*$")
+
+
 def _scan_toc_entries(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Scan the first 20 pages for TOC entries.
 
-    Handles two formats:
+    Handles three formats:
     - HTML table (平安): <table><tr><td>标题</td><td>页码</td></tr>...
-    - Plain text (新华): 第四节 管理层讨论与分析 27
+    - Plain text forward (新华): 第四节 管理层讨论与分析 27
+    - Plain text reversed (太保): 17 经营业绩回顾与分析
     """
     entries: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
@@ -765,12 +626,17 @@ def _scan_toc_entries(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         seen.add(key)
                         entries.append({"title": title, "reported_page_no": page_no, "toc_page_idx": page_idx})
 
-        # 2. Plain text format (新华 / 格式："第X节 标题 页码")
+        # 2. Plain text (新华: "标题 页码"；太保: "页码 标题" 两种格式)
         raw = re.sub(r"<[^>]+>", "", text)
         plain_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        candidate_lines = [ln for ln in plain_lines if _TOC_LINE_RE.match(ln)]
-        if len(candidate_lines) >= 3:  # need a cluster to confirm it's a real TOC
-            for line in candidate_lines:
+
+        forward_lines = [ln for ln in plain_lines if _TOC_LINE_RE.match(ln)]
+        reversed_lines = [ln for ln in plain_lines if _TOC_LINE_REVERSED_RE.match(ln)
+                          and not _TOC_LINE_RE.match(ln)]  # don't double-count
+
+        # forward format (新华 style)
+        if len(forward_lines) >= 3:
+            for line in forward_lines:
                 m = _TOC_LINE_RE.match(line)
                 if m:
                     title = m.group(1).strip()
@@ -781,8 +647,72 @@ def _scan_toc_entries(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             seen.add(key)
                             entries.append({"title": title, "reported_page_no": page_no, "toc_page_idx": page_idx})
 
+        # reversed format (太保 style: "17 经营业绩回顾与分析")
+        if len(reversed_lines) >= 3:
+            for line in reversed_lines:
+                m = _TOC_LINE_REVERSED_RE.match(line)
+                if m:
+                    page_no = int(m.group(1))
+                    title = m.group(2).strip()
+                    if 1 <= page_no <= 600 and 2 <= len(title) <= 60:
+                        key = (title, page_no)
+                        if key not in seen:
+                            seen.add(key)
+                            entries.append({"title": title, "reported_page_no": page_no, "toc_page_idx": page_idx})
+
     entries.sort(key=lambda e: e["reported_page_no"])
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Sub-TOC detection: some reports embed a "财务报告 页次" index page inside the
+# financial section that maps statement names to absolute page_idx values.
+# (e.g. 人保 page 119: "合并及公司资产负债表 126  合并及公司利润表 129  ...")
+# ---------------------------------------------------------------------------
+
+_FINANCIAL_STMT_SUBTOC_NAMES: list[str] = [
+    "合并及公司资产负债表",
+    "合并资产负债表",
+    "合并及公司利润表",
+    "合并利润表",
+    "财务报表附注",
+    "合并现金流量表",
+    "合并股东权益变动表",
+]
+
+
+def _extract_financial_page_map(pages: list[dict[str, Any]]) -> dict[str, int]:
+    """Scan all pages for a sub-TOC listing financial-statement names + page numbers.
+
+    Returns a mapping like: {"合并资产负债表": 126, "合并利润表": 129, ...}
+    Page numbers are always returned as absolute page_idx values.
+
+    Handles two formats:
+      - Absolute: "合并资产负债表 126"  (人保)
+      - Relative with P prefix: "合并资产负债表 P5"  (太保) — offset from sub-TOC page
+    """
+    # Pattern captures optional "P" prefix and the digit part
+    _SUBTOC_NUM_RE_SUFFIX = r"[^\dP\n]{0,15}(P?)(\d{1,4})"
+
+    for page in pages:
+        text = str(page.get("text") or "")
+        page_idx = int(page["page_idx"])
+        found: dict[str, int] = {}
+        has_p_prefix = False
+        for name in _FINANCIAL_STMT_SUBTOC_NAMES:
+            m = re.search(re.escape(name) + _SUBTOC_NUM_RE_SUFFIX, text)
+            if m:
+                if m.group(1) == "P":
+                    has_p_prefix = True
+                found[name] = int(m.group(2))
+
+        if len(found) >= 2:
+            # If "P" prefix detected, numbers are relative to this page
+            if has_p_prefix:
+                found = {k: page_idx + v for k, v in found.items()}
+            return found
+
+    return {}
 
 
 def _compute_toc_offset(
@@ -887,6 +817,151 @@ def toc_scan(args: argparse.Namespace) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Note-level filtering: extract only sub-notes referenced in BS/IS
+# ---------------------------------------------------------------------------
+
+_CN_NUM_MAP = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+               "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
+               "十三": 13, "十四": 14, "十五": 15, "十六": 16, "十七": 17,
+               "十八": 18, "十九": 19, "二十": 20}
+
+
+def _parse_note_refs_from_slim(slim_paths: list[str]) -> tuple[str | None, set[int], int | None]:
+    """Parse BS/IS slim markdown to extract (main_section_cn, {sub_note_numbers}).
+
+    E.g. for 太保 BS: main_section = "六", sub_notes = {1, 2, 3, 5, 6, ...}
+    """
+    main_section: str | None = None
+    sub_notes: set[int] = set()
+    first_bs_note: int | None = None  # first note from first BS line item
+
+    for slim_path in slim_paths:
+        text = Path(slim_path).expanduser().resolve().read_text(encoding="utf-8")
+        is_bs = "balance_sheet" in slim_path or "资产负债表" in text[:200]
+
+        # Find main section: "附注六", "附注七", "附注八", etc.
+        if main_section is None:
+            m = re.search(r"附注([一二三四五六七八九十]+)", text)
+            if m:
+                main_section = m.group(1)
+
+        # Extract sub-note numbers from table cells
+        # Handles: "| 1 |", "| 8/56(1) |", "| 10/56(2) |"
+        for m in re.finditer(r"\|\s*(\d{1,2})(?:[/\s（(]|\s*\|)", text):
+            val = int(m.group(1))
+            if 1 <= val <= 99:
+                sub_notes.add(val)
+                if is_bs and first_bs_note is None:
+                    first_bs_note = val
+
+    # When no main section prefix (e.g. 新华 uses "附注" without section number),
+    # note numbers < first BS reference are likely false positives from general
+    # accounting policy sections (1-7 etc.).  Filter them out.
+    if main_section is None and first_bs_note is not None and first_bs_note > 3:
+        sub_notes = {n for n in sub_notes if n >= first_bs_note}
+
+    return main_section, sub_notes, first_bs_note
+
+
+def _filter_notes_by_refs(
+    pages: list[dict[str, Any]],
+    pages_map: dict[int, dict[str, Any]],
+    start_idx: int,
+    end_idx: int,
+    ref_slim_paths: list[str],
+    footer_noise: set[str],
+) -> set[int]:
+    """Return set of page_idx values that contain referenced sub-notes.
+
+    Scans the financial notes section to find:
+    1. The main section header (e.g. "六、合并财务报表...")
+    2. Sub-note headings (e.g. "1. 货币资金", "2. 衍生金融工具")
+    3. Continuation pages of referenced sub-notes
+    """
+    main_section_cn, sub_notes, first_bs_note = _parse_note_refs_from_slim(ref_slim_paths)
+    if not sub_notes:
+        # No refs found — return all pages as fallback
+        return set(range(start_idx, end_idx + 1))
+
+    # Convert main section Chinese numeral to find the section header
+    main_num = _CN_NUM_MAP.get(main_section_cn, 0) if main_section_cn else 0
+    # Build Chinese section prefix: "六、" or "七、"
+    section_prefix = f"{main_section_cn}、" if main_section_cn else None
+
+    # Scan pages in the notes range
+    # Track which note/sub-note is "active" on each page
+    included: set[int] = set()
+    in_main_section = False if section_prefix else True  # No prefix = start immediately
+    current_subnote: int | None = None
+    # Pattern: "N. " or "N、" at start of a line (sub-note heading)
+    _SUBNOTE_RE = re.compile(r"(?:^|\n)\s*(\d{1,2})[、\.\s]")
+    # Chinese numeral section headings: "八、货币资金" → note 8
+    _CN_SECTION_RE = re.compile(
+        r"(?:^|\n)(" + "|".join(re.escape(k) for k in sorted(_CN_NUM_MAP, key=len, reverse=True)) + r")[、\.]"
+    )
+
+    for idx in range(start_idx, end_idx + 1):
+        page = pages_map.get(idx)
+        if page is None:
+            continue
+        text = str(page.get("text") or "")
+
+        # Detect main section start (when section_prefix is known)
+        if section_prefix and not in_main_section:
+            if section_prefix in text[:60]:
+                in_main_section = True
+                current_subnote = min(sub_notes) if sub_notes else 1
+
+        if not in_main_section:
+            continue
+
+        # Detect next main section → stop (only when we're inside a known section)
+        # Check first 3 lines since some pages start with a running header
+        if section_prefix:
+            next_cn = {v: k for k, v in _CN_NUM_MAP.items()}.get(main_num + 1)
+            if next_cn:
+                head_text = "\n".join(text.split("\n")[:3])
+                if f"{next_cn}、" in head_text:
+                    break
+
+        # --- Determine current note number on this page ---
+        # Method 1: Arabic numeral headings (sub-notes under a main section)
+        subnote_matches = list(_SUBNOTE_RE.finditer(text[:500]))
+        if subnote_matches:
+            current_subnote = int(subnote_matches[0].group(1))
+
+        # Method 2: Continuation "(续)" with sub-note number
+        cont_match = re.search(r"[（\(]续[）\)].*?(\d{1,2})[、\.\s]", text[:200])
+        if cont_match:
+            current_subnote = int(cont_match.group(1))
+
+        # Method 3: Chinese numeral section headings (新华 style: "八、货币资金")
+        # Used when no main section prefix (notes are top-level numbered)
+        if not section_prefix:
+            cn_match = _CN_SECTION_RE.search(text[:60])
+            if cn_match:
+                cn_num = _CN_NUM_MAP.get(cn_match.group(1))
+                if cn_num is not None:
+                    current_subnote = cn_num
+
+        # Method 4 (no-prefix fallback): when the previous section was below
+        # the BS threshold and this page has no heading but starts with data
+        # content (table), it likely belongs to the first referenced note.
+        # E.g. 新华: after section 7 ends, pages 188-189 have note 8/9 data
+        # but no heading.
+        if (not section_prefix
+                and first_bs_note is not None
+                and (current_subnote is None or current_subnote < first_bs_note)
+                and text.lstrip().startswith("<table>")):
+            current_subnote = first_bs_note
+
+        if current_subnote is not None and current_subnote in sub_notes:
+            included.add(idx)
+
+    return included
+
+
 def section_slim(args: argparse.Namespace) -> None:
     """Extract a named section's pages and output a slim LLM-ready markdown.
 
@@ -927,8 +1002,13 @@ def section_slim(args: argparse.Namespace) -> None:
         if any(pat.search(e["title"]) for pat in toc_patterns)
     ]
 
+    # --- TOC hit with verification ---
+    # If a TOC entry matches, verify that the mapped page actually contains
+    # relevant content (body_patterns).  H+A dual-listed reports (人保, 人寿)
+    # have different page offsets for front vs. financial sections, so a TOC hit
+    # can map to the wrong page.  If verification fails, fall through to body scan.
+    toc_verified = False
     if matched:
-        # TOC hit: use page range from toc.json
         if merge_consecutive:
             first_idx = toc_entries.index(matched[0])
             last_idx = toc_entries.index(matched[-1])
@@ -937,10 +1017,49 @@ def section_slim(args: argparse.Namespace) -> None:
         else:
             start_page_idx = matched[0]["start_page_idx"]
             end_page_idx = matched[0]["end_page_idx"]
+
+        # Fix invalid range
+        if end_page_idx < start_page_idx:
+            matched_pos = toc_entries.index(matched[-1])
+            stop_pats = section_config.get("stop_body_patterns", []) if section_key in SECTION_TYPES else []
+            stop_res = [re.compile(p, re.IGNORECASE) for p in stop_pats]
+            found_end = False
+            if merge_consecutive and stop_res:
+                for subsequent in toc_entries[matched_pos + 1 :]:
+                    if any(sr.search(subsequent["title"]) for sr in stop_res):
+                        end_page_idx = subsequent["start_page_idx"] - 1
+                        found_end = True
+                        break
+            if not found_end:
+                for subsequent in toc_entries[matched_pos + 1 :]:
+                    if subsequent["start_page_idx"] > start_page_idx:
+                        end_page_idx = subsequent["start_page_idx"] - 1
+                        break
+                else:
+                    end_page_idx = int(pages[-1]["page_idx"])
+
+        # Verify: check that at least one body_pattern appears as a heading
+        # in the first few pages of the mapped range.  If not, the offset is
+        # likely wrong (common with H+A dual-listed reports).
+        body_patterns_list: list[str] = section_config.get("body_patterns", []) if section_key in SECTION_TYPES else []
+        # Use strict heading check for non-financial sections (management-discussion)
+        # to avoid matching TOC pages or reference text.
+        _has_subtoc = bool(section_config.get("subtoc_names")) if section_key in SECTION_TYPES else False
+        _verify_fn = _matches_near_top if _has_subtoc else _matches_as_heading
+        if body_patterns_list:
+            verify_end = min(start_page_idx + 3, end_page_idx + 1)
+            for check_idx in range(start_page_idx, verify_end):
+                page_data = pages_map.get(check_idx)
+                if page_data and _verify_fn(str(page_data.get("text") or ""), body_patterns_list):
+                    toc_verified = True
+                    break
+        else:
+            toc_verified = True  # no body patterns to verify against
+
+    if matched and toc_verified:
         fallback_used = False
     else:
         # Fallback: find the section by scanning the document body.
-        # Outer bounds come from the "财务报告/财务报表" TOC entry (e.g. 新华).
         body_patterns_list: list[str] = section_config.get("body_patterns", []) if section_key in SECTION_TYPES else []
         if not body_patterns_list:
             available = [e["title"] for e in toc_entries]
@@ -949,40 +1068,53 @@ def section_slim(args: argparse.Namespace) -> None:
                 f"Available TOC entries ({len(available)}): {available}"
             )
 
-        # Find outer bounds from the financial-report TOC entry
-        outer_start = 0
-        outer_end = int(pages[-1]["page_idx"])
-        for e in toc_entries:
-            if re.search(r"财务报告|财务报表", e["title"]):
-                outer_start = e["start_page_idx"]
-                outer_end = e["end_page_idx"]
-                break
-
-        # Find start page by body pattern near top of page.
-        # Skip audit report pages (they reference statement names in narrative text).
-        _AUDIT_RE = re.compile(r"审计报告|Auditor")
-        start_page_idx = outer_end  # pessimistic default
-        for page in pages:
-            idx = int(page["page_idx"])
-            if idx < outer_start or idx > outer_end:
-                continue
-            text = str(page.get("text") or "")
-            if _AUDIT_RE.search(text[:150]):  # skip audit report pages
-                continue
-            if _matches_near_top(text, body_patterns_list):
-                start_page_idx = idx
-                break
-
-        # Find end page using stop patterns
+        last_page_idx = int(pages[-1]["page_idx"])
         stop_body_patterns: list[str] = section_config.get("stop_body_patterns", []) if section_key in SECTION_TYPES else []
-        end_page_idx = outer_end
+        subtoc_names: list[str] = section_config.get("subtoc_names", []) if section_key in SECTION_TYPES else []
+        _has_subtoc = bool(subtoc_names)
+        # Non-financial sections use strict heading match to skip TOC pages
+        _body_match_fn = _matches_near_top if _has_subtoc else _matches_as_heading
+
+        # Step 1: try sub-TOC lookup (e.g. 人保 page 119 "合并及公司资产负债表 126")
+        start_page_idx: int | None = None
+        if subtoc_names:
+            fin_map = _extract_financial_page_map(pages)
+            for name in subtoc_names:
+                if name in fin_map:
+                    start_page_idx = fin_map[name]
+                    break
+
+        # Step 2: body pattern scan across the FULL document if sub-TOC didn't work
+        _AUDIT_RE = re.compile(r"审计报告|Auditor")
+        if start_page_idx is None:
+            for page in pages:
+                idx = int(page["page_idx"])
+                text = str(page.get("text") or "")
+                if _AUDIT_RE.search(text[:150]):
+                    continue
+                if _body_match_fn(text, body_patterns_list):
+                    start_page_idx = idx
+                    break
+
+        if start_page_idx is None:
+            available = [e["title"] for e in toc_entries]
+            raise RuntimeError(
+                f"Could not locate section '{section_key}' in the document body.\n"
+                f"Available TOC entries: {available}"
+            )
+
+        # Step 3: find end using stop patterns (search full doc after start)
+        # Use heading-level match for non-financial sections to avoid stopping
+        # on table cells that mention the stop keyword (e.g. "集团内含价值" in a table).
+        _stop_match_fn = _matches_near_top if _has_subtoc else _matches_as_heading
+        end_page_idx = last_page_idx
         if stop_body_patterns:
             for page in pages:
                 idx = int(page["page_idx"])
-                if idx <= start_page_idx or idx > outer_end:
+                if idx <= start_page_idx or idx > last_page_idx:
                     continue
                 text = str(page.get("text") or "")
-                if _matches_near_top(text, stop_body_patterns):
+                if _stop_match_fn(text, stop_body_patterns):
                     end_page_idx = idx - 1
                     break
         fallback_used = True
@@ -990,9 +1122,21 @@ def section_slim(args: argparse.Namespace) -> None:
     if args.max_pages and (end_page_idx - start_page_idx + 1) > args.max_pages:
         end_page_idx = start_page_idx + args.max_pages - 1
 
+    # --- Note-level filtering for financial-notes ---
+    # If --ref-slim files are provided and this is a financial-notes section,
+    # only include pages whose sub-note numbers are referenced in the BS/IS.
+    ref_slim_paths: list[str] = getattr(args, "ref_slim", None) or []
+    note_page_filter: set[int] | None = None  # None = include all pages
+    if ref_slim_paths and section_key == "financial-notes":
+        note_page_filter = _filter_notes_by_refs(
+            pages, pages_map, start_page_idx, end_page_idx, ref_slim_paths, footer_noise,
+        )
+
     # Build slim output
     chunks: list[str] = []
     for idx in range(start_page_idx, end_page_idx + 1):
+        if note_page_filter is not None and idx not in note_page_filter:
+            continue
         page = pages_map.get(idx)
         if page is None:
             continue
@@ -1016,7 +1160,7 @@ def section_slim(args: argparse.Namespace) -> None:
                 "matched_toc_entries": [e["title"] for e in matched] if matched else [],
                 "fallback_body_scan": fallback_used,
                 "page_range": {"start": start_page_idx, "end": end_page_idx},
-                "pages_included": end_page_idx - start_page_idx + 1,
+                "pages_included": len(chunks),
                 "output": str(output_path),
                 "chars": len(output_text),
                 "est_tokens": est_tokens,
@@ -1099,18 +1243,6 @@ def _select_page_range(
     ]
 
 
-def _auto_select_statement_pages(
-    pages: list[dict[str, Any]],
-    theme_config: dict[str, Any],
-) -> list[int]:
-    statement_patterns = list(theme_config.get("statement_patterns") or DEFAULT_STATEMENT_PATTERNS)
-    return _find_page_indices_by_patterns(
-        pages,
-        statement_patterns,
-        skip_toc_pages=True,
-    )
-
-
 def _extract_excerpt(text: str, keywords: list[str], max_chars: int = 500) -> str:
     normalized = _clean_note_text(text)
     for keyword in keywords:
@@ -1122,9 +1254,33 @@ def _extract_excerpt(text: str, keywords: list[str], max_chars: int = 500) -> st
     return normalized[:max_chars].strip()
 
 
+_TOC_PAGE_RE = re.compile(r"目\s*录")
+
+
 def _matches_near_top(text: str, patterns: list[str], max_offset: int = 220) -> bool:
     head = str(text or "")[:max_offset]
     return any(re.search(pattern, head, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _matches_as_heading(text: str, patterns: list[str]) -> bool:
+    """Check if any pattern appears as a heading in the first ~80 chars of the page.
+
+    Stricter than _matches_near_top: avoids matching TOC pages or pages that
+    merely *reference* the section name in running text.
+    """
+    text = str(text or "")
+    # Skip main TOC pages
+    if _TOC_PAGE_RE.search(text[:30]):
+        return False
+    # Skip mini-TOC / section-divider pages: if 2+ of the first 5 lines
+    # look like "title  number" entries, it's a TOC page, not real content.
+    first_lines = [ln.strip() for ln in text.split("\n")[:6] if ln.strip()]
+    toc_line_count = sum(1 for ln in first_lines if _TOC_LINE_RE.match(ln) or _TOC_LINE_REVERSED_RE.match(ln))
+    if toc_line_count >= 2:
+        return False
+    # Check only the first line (section headings are always the first line)
+    first_line = text.split("\n")[0].strip() if text else ""
+    return any(re.search(pattern, first_line, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def _score_page_for_keywords(text: str, keywords: list[str]) -> tuple[int, list[str]]:
@@ -1196,315 +1352,6 @@ def _detect_theme_hits(
     return hits
 
 
-def _match_note_section(
-    row: StatementRow, note_sections: list[NoteSection]
-) -> NoteSection | None:
-    if row.note_reference:
-        for section in note_sections:
-            if section.note_no == row.note_reference:
-                return section
-
-    target = _normalize_item_name(row.item_name)
-    if not target:
-        return None
-
-    for section in note_sections:
-        title = _normalize_item_name(section.title)
-        if title == target or target in title or title in target:
-            return section
-    return None
-
-
-def locate_statement_notes(args: argparse.Namespace) -> None:
-    pages_json_path = Path(args.pages_json).expanduser().resolve()
-    pages_payload = _load_pages_payload(pages_json_path)
-    pages = pages_payload["pages"]
-    artifact_prefix = _derive_artifact_prefix(pages_json_path)
-    theme_config = _get_theme_config(args.theme)
-
-    statement_page_indices = args.statement_pages or _auto_select_statement_pages(
-        pages, theme_config
-    )
-    statement_pages = _select_pages(
-        pages=pages,
-        page_indices=statement_page_indices,
-        fallback_tags=("statement:",),
-    )
-
-    inferred_note_window = None
-    note_page_indices = args.notes_pages
-    if note_page_indices is None:
-        inferred_note_window = _infer_note_window(pages, theme_config)
-        if inferred_note_window is not None:
-            note_page_indices = inferred_note_window.page_indices
-    notes_pages = _select_pages(
-        pages=pages,
-        page_indices=note_page_indices,
-        fallback_tags=("notes:",),
-    )
-    if not statement_pages:
-        raise RuntimeError("No statement pages found for locator.")
-    if not notes_pages:
-        raise RuntimeError("No note pages found for locator.")
-
-    statement_rows = _parse_statement_rows(statement_pages)
-    note_sections = _build_note_sections(notes_pages)
-
-    results: list[dict[str, Any]] = []
-    for row in statement_rows:
-        matched = _match_note_section(row, note_sections)
-        if matched is None:
-            matched = _build_fallback_note_section(row, notes_pages)
-        results.append(
-            {
-                **asdict(row),
-                "matched_note": (
-                    {
-                        "note_no": matched.note_no,
-                        "title": matched.title,
-                        "start_page_idx": matched.start_page_idx,
-                        "end_page_idx": matched.end_page_idx,
-                        "pages": matched.pages,
-                        "text_excerpt": matched.text[: args.max_note_chars],
-                    }
-                    if matched
-                    else None
-                ),
-            }
-        )
-
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    statement_rows_path = output_dir / f"{artifact_prefix}.statement_rows.json"
-    note_sections_path = output_dir / f"{artifact_prefix}.note_sections.json"
-    statement_note_map_path = output_dir / f"{artifact_prefix}.statement_note_map.json"
-    statement_rows_path.write_text(
-        json.dumps([asdict(row) for row in statement_rows], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    note_sections_path.write_text(
-        json.dumps([asdict(section) for section in note_sections], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    statement_note_map_path.write_text(
-        json.dumps(results, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    matched_count = sum(1 for item in results if item["matched_note"] is not None)
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "output_dir": str(output_dir),
-                "statement_rows_json": str(statement_rows_path),
-                "note_sections_json": str(note_sections_path),
-                "statement_note_map_json": str(statement_note_map_path),
-                "theme": args.theme,
-                "statement_pages": [int(page["page_idx"]) for page in statement_pages],
-                "notes_page_range": {
-                    "start_page_idx": int(notes_pages[0]["page_idx"]),
-                    "end_page_idx": int(notes_pages[-1]["page_idx"]),
-                    "num_pages": len(notes_pages),
-                    "auto_detected": args.notes_pages is None,
-                },
-                "inferred_note_window": (
-                    asdict(inferred_note_window) if inferred_note_window is not None else None
-                ),
-                "statement_rows": len(statement_rows),
-                "note_sections": len(note_sections),
-                "matched_rows": matched_count,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-
-
-def _clean_table_cell(text: str) -> str:
-    value = re.sub(r"<[^>]+>", "", text)
-    value = value.replace("\xa0", " ")
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
-
-
-def _extract_tables_from_text(text: str) -> list[list[list[str]]]:
-    tables: list[list[list[str]]] = []
-    for table_html in re.findall(r"<table>(.*?)</table>", text, flags=re.DOTALL):
-        rows: list[list[str]] = []
-        for row_html in re.findall(r"<tr>(.*?)</tr>", table_html, flags=re.DOTALL):
-            cells = [
-                _clean_table_cell(cell_html)
-                for cell_html in re.findall(
-                    r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.DOTALL
-                )
-            ]
-            if cells:
-                rows.append(cells)
-        if rows:
-            tables.append(rows)
-    return tables
-
-
-def _extract_unit(text: str) -> str | None:
-    match = re.search(r"金额单位为([^\n）)]+)", text)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-def _split_sentences(text: str) -> list[str]:
-    normalized = _clean_note_text(text)
-    normalized = re.sub(r"<table>.*?</table>", "", normalized, flags=re.DOTALL)
-    normalized = normalized.replace("\n", "")
-    parts = re.split(r"(?<=[。；])", normalized)
-    return [part.strip() for part in parts if part.strip()]
-
-
-def _collect_policy_sentences(item_name: str, note_text: str) -> list[str]:
-    normalized_name = _normalize_item_name(item_name)
-    keywords = [
-        normalized_name,
-        "不能用于日常经营",
-        "按",
-        "减值准备",
-        "折算汇率",
-        "受限制",
-        "抵押",
-        "冻结",
-        "质押品",
-        "分析如下",
-        "可收回金额",
-        "折现率",
-        "增长率",
-        "可抵扣亏损",
-        "互抵金额",
-    ]
-    sentences: list[str] = []
-    for sentence in _split_sentences(note_text):
-        normalized_sentence = _normalize_item_name(sentence)
-        if any(keyword and keyword in normalized_sentence for keyword in keywords):
-            sentences.append(sentence)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for sentence in sentences:
-        if sentence not in seen:
-            seen.add(sentence)
-            deduped.append(sentence)
-    return deduped
-
-
-def _find_matching_table_rows(
-    item_name: str,
-    current_amount: str | None,
-    prior_amount: str | None,
-    tables: list[list[list[str]]],
-) -> list[dict[str, Any]]:
-    normalized_name = _normalize_item_name(item_name)
-    scored_matches: list[tuple[int, dict[str, Any]]] = []
-    for table_idx, table in enumerate(tables):
-        for row_idx, row in enumerate(table):
-            if not any(cell.strip() for cell in row):
-                continue
-            normalized_cells = [_normalize_item_name(cell) for cell in row]
-            score = 0
-            if any(normalized_name and normalized_name == cell for cell in normalized_cells):
-                score += 100
-            elif any(
-                normalized_name and (
-                    normalized_name in cell or cell in normalized_name
-                )
-                for cell in normalized_cells
-                if cell
-            ):
-                score += 60
-
-            has_current = bool(current_amount and current_amount in row)
-            has_prior = bool(prior_amount and prior_amount in row)
-            if has_current and has_prior:
-                score += 80
-            elif has_current or has_prior:
-                score += 20
-
-            if score > 0:
-                scored_matches.append(
-                    (
-                        score,
-                        {
-                            "table_index": table_idx,
-                            "row_index": row_idx,
-                            "cells": row,
-                        },
-                    )
-                )
-
-    scored_matches.sort(
-        key=lambda item: (
-            -item[0],
-            item[1]["table_index"],
-            item[1]["row_index"],
-        )
-    )
-    matches: list[dict[str, Any]] = []
-    seen_rows: set[tuple[int, int]] = set()
-    for _, row_data in scored_matches:
-        row_key = (row_data["table_index"], row_data["row_index"])
-        if row_key in seen_rows:
-            continue
-        seen_rows.add(row_key)
-        matches.append(
-            {
-                "table_index": row_data["table_index"],
-                "row_index": row_data["row_index"],
-                "cells": row_data["cells"],
-            }
-        )
-    return matches
-
-
-def _build_fallback_note_section(
-    row: StatementRow,
-    notes_pages: list[dict[str, Any]],
-) -> NoteSection | None:
-    normalized_name = _normalize_item_name(row.item_name)
-    best_page: dict[str, Any] | None = None
-    best_score = 0
-    for page in notes_pages:
-        text = str(page.get("text") or "")
-        page_idx = int(page["page_idx"])
-        score = 0
-        normalized_text = _normalize_item_name(text)
-        if normalized_name and normalized_name in normalized_text:
-            score += 50
-        if row.current_period_amount and row.current_period_amount in text:
-            score += 40
-        if row.prior_period_amount and row.prior_period_amount in text:
-            score += 30
-
-        table_matches = _find_matching_table_rows(
-            item_name=row.item_name,
-            current_amount=row.current_period_amount,
-            prior_amount=row.prior_period_amount,
-            tables=_extract_tables_from_text(text),
-        )
-        if table_matches:
-            score += 60
-
-        if score > best_score:
-            best_score = score
-            best_page = {"page_idx": page_idx, "text": text}
-
-    if best_page is None or best_score < 90:
-        return None
-
-    return NoteSection(
-        note_no=row.note_reference or "",
-        title=row.item_name,
-        start_page_idx=int(best_page["page_idx"]),
-        end_page_idx=int(best_page["page_idx"]),
-        pages=[int(best_page["page_idx"])],
-        text=_clean_note_text(str(best_page["text"])),
-    )
 
 
 def build_extraction_records(args: argparse.Namespace) -> None:
@@ -1962,21 +1809,6 @@ def convert_pdf(args: argparse.Namespace) -> None:
     )
 
 
-def _select_pages(
-    pages: list[dict[str, Any]],
-    page_indices: list[int] | None,
-    fallback_tags: tuple[str, ...],
-) -> list[dict[str, Any]]:
-    if page_indices:
-        wanted = set(page_indices)
-        return [page for page in pages if int(page["page_idx"]) in wanted]
-    return [
-        page
-        for page in pages
-        if any(str(tag).startswith(fallback_tags) for tag in page.get("matched_tags", []))
-    ]
-
-
 def build_parser() -> argparse.ArgumentParser:
     theme_choices = sorted(THEME_PRESETS)
     parser = argparse.ArgumentParser(
@@ -2024,34 +1856,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Regex for locating notes pages. Can be repeated.",
     )
     convert_parser.set_defaults(func=convert_pdf)
-
-    locate_parser = subparsers.add_parser(
-        "locate",
-        help="Locate note sections corresponding to balance-sheet rows.",
-    )
-    locate_parser.add_argument("--pages-json", required=True, help="Path to pages.json.")
-    locate_parser.add_argument("--output-dir", required=True)
-    locate_parser.add_argument(
-        "--theme",
-        choices=theme_choices,
-        default="balance-sheet",
-        help="Extraction theme preset. Current row-to-note mapping is implemented for balance-sheet best.",
-    )
-    locate_parser.add_argument("--statement-pages", type=int, nargs="*")
-    locate_parser.add_argument("--notes-pages", type=int, nargs="*")
-    locate_parser.add_argument("--max-note-chars", type=int, default=4000)
-    locate_parser.set_defaults(func=locate_statement_notes)
-
-    records_parser = subparsers.add_parser(
-        "build-records",
-        help="Build structured extraction records from statement-note mappings.",
-    )
-    records_parser.add_argument("--mapping-json", required=True)
-    records_parser.add_argument("--output-dir", required=True)
-    records_parser.add_argument("--max-note-chars", type=int, default=4000)
-    records_parser.add_argument("--max-rows-per-item", type=int, default=12)
-    records_parser.add_argument("--max-policy-sentences", type=int, default=8)
-    records_parser.set_defaults(func=build_extraction_records)
 
     theme_parser = subparsers.add_parser(
         "extract-theme",
@@ -2131,6 +1935,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Cap the section at this many pages (useful for very long financial-notes).",
+    )
+    section_parser.add_argument(
+        "--ref-slim",
+        nargs="+",
+        default=None,
+        help=(
+            "For financial-notes: path(s) to balance-sheet / income-statement slim .md files. "
+            "When provided, only sub-notes referenced in those statements are extracted."
+        ),
     )
     section_parser.set_defaults(func=section_slim)
 

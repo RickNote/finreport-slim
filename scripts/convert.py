@@ -166,7 +166,8 @@ def _download_and_extract_zip_to_temp(zip_url: str) -> Path:
     temp_dir = Path(tempfile.mkdtemp(prefix="mineru_zip_"))
     zip_path = temp_dir / "mineru_result.zip"
     print("  Downloading result ZIP ...", flush=True)
-    with requests.get(zip_url, timeout=300, stream=True) as resp:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; finreport-slim/1.0)"}
+    with requests.get(zip_url, headers=headers, timeout=300, stream=True) as resp:
         resp.raise_for_status()
         with zip_path.open("wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
