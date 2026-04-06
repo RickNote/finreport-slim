@@ -126,23 +126,25 @@ from themes import THEME_PRESETS
 ### 完整格式
 
 ```python
-"balance-sheet": {
-    "description": "合并资产负债表主表及附注映射",
+"investment-assets": {
+    "description": "投资资产情况及资产配置结构",
     "statement_patterns": [
+        r"投资资产情况",
         r"合并资产负债表",
-        r"Consolidated Balance Sheet",
+        r"投资组合",
     ],
     "note_start_patterns": [
+        r"合并财务报表项目附注",
         r"财务报表附注",
     ],
     "note_stop_patterns": [
         r"附录：财务报表补充资料",
     ],
     "keywords": [
-        "资产负债表",
         "货币资金",
-        "商誉",
-        "递延所得税资产",
+        "债权投资",
+        "长期股权投资",
+        "投资性房地产",
     ],
 },
 ```
@@ -361,6 +363,68 @@ output/<stem>/
 过滤策略：先预检页面尾部 8 行内是否存在噪声，确认存在后才启用移除；页头同理。这样既能清除噪声，又不会误删正文。
 
 如果后续新样本中出现未覆盖的固定页脚，优先去 `_is_footer_noise_line()` 补模式。如需添加新的通用页脚正则，修改 `_FOOTER_GENERIC_RE` 列表。
+
+## 附注数字 → 附注详情的提取逻辑
+
+这条链路由 `locate` + `build-records` 两步组成，专门处理"主表行 → 对应附注段落"的映射问题。
+
+### 整体流程
+
+```text
+pages.json
+  -> locate   (主表行解析 + 附注区间推断 + 行-节匹配)
+  -> statement_note_map.json
+  -> build-records  (附注段落结构化：表格行、政策句)
+  -> records.json
+```
+
+### locate 命令做了什么（四步）
+
+**Step 1 — 解析主表行**（`_parse_statement_rows`）
+
+用正则扫描主表页的 HTML 表格，提取每行的：
+
+- `item_name`：科目名（如"货币资金"）
+- `note_reference`：附注序号（如"1"、"12"——就是报表里对应列里的那个小数字）
+- 当期 / 上期金额
+
+只保留有金额的行；大类标题行（"资产"、"负债"等）被过滤掉。
+
+**Step 2 — 推断附注页区间**（`_infer_note_window`）
+
+用 `note_start_patterns` 找到附注起始页，用 `note_stop_patterns`（如有）找到终止页。
+
+如果 pattern 找不到，会回退到目录页（TOC）里查找"财务报表附注"条目，再根据报告页码估算起始位置。
+
+**Step 3 — 解析附注章节**（`_build_note_sections`）
+
+在附注页范围内，用正则 `^\d{1,2}\.\s*标题` 识别每个附注的编号和标题，并把跨页内容拼合成完整的 `NoteSection`。
+
+**Step 4 — 匹配主表行与附注**（`_match_note_section`）
+
+两级匹配策略：
+
+1. **优先按编号**：`row.note_reference == section.note_no`（主表里写"12"就直接找第12条附注）
+2. **按科目名回退**：`_normalize_item_name()` 标准化后做包含匹配（适合附注序号缺失的情况）
+3. **全文兜底**：如果上面都没命中，在所有附注页里按科目名、金额字符串打分，取最高分页面
+
+### build-records 命令做了什么
+
+读取 `statement_note_map.json`，对每条已匹配的附注段落：
+
+- 提取附注里的表格行（按科目名和金额打分定位最相关的行）
+- 提取会计政策句（按"减值准备""按""抵押"等关键词过滤）
+- 输出结构化 `records.json`
+
+### 适用场景说明
+
+`locate` 命令对主表格式有一定假设：标准四列表格（科目名 / 附注序号 / 当期金额 / 上期金额）。
+
+- **合并资产负债表**：完全适用，格式标准
+- **合并利润表**：同样适用，格式相似
+- **管理口径投资组合表**（按投资品种/会计计量分类）：列结构可能不同，附注序号字段可能为空，匹配会更多依赖第三级兜底策略
+
+如果要对合并利润表也做行-附注映射，在 `themes.py` 里加一个主题，`statement_patterns` 指向"合并利润表"，`note_start_patterns` 同用"合并财务报表项目附注"，然后用 `locate --theme <该主题>` 即可。
 
 ## 限制
 
