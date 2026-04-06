@@ -18,6 +18,7 @@ from typing import Any
 import requests
 
 from themes import THEME_PRESETS
+from sections import SECTION_TYPES
 
 
 DEFAULT_STATEMENT_PATTERNS = [
@@ -709,6 +710,321 @@ def _find_toc_entries(pages: list[dict[str, Any]], max_page_idx: int = 20) -> li
                     }
                 )
     return entries
+
+
+# ---------------------------------------------------------------------------
+# TOC-driven extraction (toc-scan + section-slim)
+# ---------------------------------------------------------------------------
+
+_TOC_LINE_RE = re.compile(r"^(.{2,60}?)\s{1,}(\d{1,4})\s*$")
+
+# Anchors used to compute offset between TOC page numbers and actual page_idx.
+# Each tuple: (substring to find in TOC title, pattern to match near top of body page)
+_TOC_OFFSET_ANCHORS: list[tuple[str, str]] = [
+    ("合并资产负债表", r"合并资产负债表"),
+    ("合并利润表", r"合并利润表"),
+    ("财务报表附注", r"财务报表附注"),
+    ("管理层讨论与分析", r"管理层讨论与分析"),
+    ("业绩综述", r"业绩综述"),
+]
+
+
+def _scan_toc_entries(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Scan the first 20 pages for TOC entries.
+
+    Handles two formats:
+    - HTML table (平安): <table><tr><td>标题</td><td>页码</td></tr>...
+    - Plain text (新华): 第四节 管理层讨论与分析 27
+    """
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    for page in pages:
+        page_idx = int(page["page_idx"])
+        if page_idx > 20:
+            break
+        text = str(page.get("text") or "")
+
+        # Only process pages that look like a TOC
+        if "目录" not in text and "contents" not in text.lower():
+            continue
+
+        # 1. HTML table format (平安 / H 股格式)
+        for table in _extract_tables_from_text(text):
+            for row in table:
+                if len(row) < 2:
+                    continue
+                title = row[0].strip()
+                page_no_str = row[-1].strip()
+                if not title or not re.fullmatch(r"\d{1,4}", page_no_str):
+                    continue
+                page_no = int(page_no_str)
+                if 1 <= page_no <= 600 and 2 <= len(title) <= 60:
+                    key = (title, page_no)
+                    if key not in seen:
+                        seen.add(key)
+                        entries.append({"title": title, "reported_page_no": page_no, "toc_page_idx": page_idx})
+
+        # 2. Plain text format (新华 / 格式："第X节 标题 页码")
+        raw = re.sub(r"<[^>]+>", "", text)
+        plain_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        candidate_lines = [ln for ln in plain_lines if _TOC_LINE_RE.match(ln)]
+        if len(candidate_lines) >= 3:  # need a cluster to confirm it's a real TOC
+            for line in candidate_lines:
+                m = _TOC_LINE_RE.match(line)
+                if m:
+                    title = m.group(1).strip()
+                    page_no = int(m.group(2))
+                    if 1 <= page_no <= 600 and 2 <= len(title) <= 60:
+                        key = (title, page_no)
+                        if key not in seen:
+                            seen.add(key)
+                            entries.append({"title": title, "reported_page_no": page_no, "toc_page_idx": page_idx})
+
+    entries.sort(key=lambda e: e["reported_page_no"])
+    return entries
+
+
+def _compute_toc_offset(
+    pages: list[dict[str, Any]],
+    toc_entries: list[dict[str, Any]],
+) -> int:
+    """Compute offset so that: actual page_idx = reported_page_no + offset.
+
+    Strategy: find a reliable anchor in both the TOC and the document body, then
+    compute the difference.
+    """
+    toc_map: dict[str, int] = {e["title"]: e["reported_page_no"] for e in toc_entries}
+
+    for anchor_title, body_pattern in _TOC_OFFSET_ANCHORS:
+        toc_page_no: int | None = None
+        for title, page_no in toc_map.items():
+            if anchor_title in title:
+                toc_page_no = page_no
+                break
+        if toc_page_no is None:
+            continue
+
+        compiled = re.compile(body_pattern)
+        for page in pages:
+            page_idx = int(page["page_idx"])
+            if page_idx <= 20:
+                continue
+            text = str(page.get("text") or "")
+            if compiled.search(text[:300]):
+                return page_idx - toc_page_no
+
+    return 0
+
+
+def _build_toc_with_ranges(
+    pages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Return (entries_with_ranges, offset).
+
+    Each entry gains start_page_idx and end_page_idx fields.
+    """
+    raw_entries = _scan_toc_entries(pages)
+    if not raw_entries:
+        return [], 0
+
+    offset = _compute_toc_offset(pages, raw_entries)
+    last_page_idx = int(pages[-1]["page_idx"])
+
+    result: list[dict[str, Any]] = []
+    for i, entry in enumerate(raw_entries):
+        start_idx = entry["reported_page_no"] + offset
+        end_idx = (
+            raw_entries[i + 1]["reported_page_no"] + offset - 1
+            if i + 1 < len(raw_entries)
+            else last_page_idx
+        )
+        result.append(
+            {
+                "title": entry["title"],
+                "reported_page_no": entry["reported_page_no"],
+                "start_page_idx": start_idx,
+                "end_page_idx": end_idx,
+            }
+        )
+    return result, offset
+
+
+def toc_scan(args: argparse.Namespace) -> None:
+    """Parse the TOC and output a toc.json with page-range information for every section."""
+    pages_json_path = Path(args.pages_json).expanduser().resolve()
+    pages_payload = _load_pages_payload(pages_json_path)
+    pages = pages_payload["pages"]
+    artifact_prefix = _derive_artifact_prefix(pages_json_path)
+
+    entries, offset = _build_toc_with_ranges(pages)
+    if not entries:
+        raise RuntimeError("No TOC entries found in the first 20 pages.")
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    toc_path = output_dir / f"{artifact_prefix}.toc.json"
+    payload: dict[str, Any] = {
+        "source_pdf": pages_payload.get("source_pdf"),
+        "toc_page_offset": offset,
+        "num_entries": len(entries),
+        "entries": entries,
+    }
+    toc_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "toc_json": str(toc_path),
+                "offset": offset,
+                "num_entries": len(entries),
+                "entries_preview": entries[:12],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def section_slim(args: argparse.Namespace) -> None:
+    """Extract a named section's pages and output a slim LLM-ready markdown.
+
+    Section is looked up via toc.json (or computed on-the-fly from pages.json).
+    No keyword scoring needed — the TOC gives us exact page ranges.
+    """
+    pages_json_path = Path(args.pages_json).expanduser().resolve()
+    pages_payload = _load_pages_payload(pages_json_path)
+    pages = pages_payload["pages"]
+    artifact_prefix = _derive_artifact_prefix(pages_json_path)
+    pages_map = {int(p["page_idx"]): p for p in pages}
+    footer_noise = _build_footer_noise_set(pages)
+
+    # Load or compute TOC entries with ranges
+    if args.toc_json:
+        toc_data = json.loads(Path(args.toc_json).expanduser().resolve().read_text(encoding="utf-8"))
+        toc_entries = toc_data["entries"]
+    else:
+        toc_entries, _ = _build_toc_with_ranges(pages)
+        if not toc_entries:
+            raise RuntimeError(
+                "No TOC entries found. Run 'toc-scan' first or pass --toc-json."
+            )
+
+    # Resolve section patterns
+    section_key = args.section
+    if section_key in SECTION_TYPES:
+        section_config = SECTION_TYPES[section_key]
+        toc_patterns = [re.compile(p, re.IGNORECASE) for p in section_config["toc_patterns"]]
+        merge_consecutive: bool = bool(section_config.get("merge_consecutive"))
+    else:
+        # Treat section_key as a literal TOC title substring
+        toc_patterns = [re.compile(re.escape(section_key), re.IGNORECASE)]
+        merge_consecutive = False
+
+    matched = [
+        e for e in toc_entries
+        if any(pat.search(e["title"]) for pat in toc_patterns)
+    ]
+
+    if matched:
+        # TOC hit: use page range from toc.json
+        if merge_consecutive:
+            first_idx = toc_entries.index(matched[0])
+            last_idx = toc_entries.index(matched[-1])
+            start_page_idx = toc_entries[first_idx]["start_page_idx"]
+            end_page_idx = toc_entries[last_idx]["end_page_idx"]
+        else:
+            start_page_idx = matched[0]["start_page_idx"]
+            end_page_idx = matched[0]["end_page_idx"]
+        fallback_used = False
+    else:
+        # Fallback: find the section by scanning the document body.
+        # Outer bounds come from the "财务报告/财务报表" TOC entry (e.g. 新华).
+        body_patterns_list: list[str] = section_config.get("body_patterns", []) if section_key in SECTION_TYPES else []
+        if not body_patterns_list:
+            available = [e["title"] for e in toc_entries]
+            raise RuntimeError(
+                f"No TOC entry matched section '{section_key}' and no body_patterns defined.\n"
+                f"Available TOC entries ({len(available)}): {available}"
+            )
+
+        # Find outer bounds from the financial-report TOC entry
+        outer_start = 0
+        outer_end = int(pages[-1]["page_idx"])
+        for e in toc_entries:
+            if re.search(r"财务报告|财务报表", e["title"]):
+                outer_start = e["start_page_idx"]
+                outer_end = e["end_page_idx"]
+                break
+
+        # Find start page by body pattern near top of page.
+        # Skip audit report pages (they reference statement names in narrative text).
+        _AUDIT_RE = re.compile(r"审计报告|Auditor")
+        start_page_idx = outer_end  # pessimistic default
+        for page in pages:
+            idx = int(page["page_idx"])
+            if idx < outer_start or idx > outer_end:
+                continue
+            text = str(page.get("text") or "")
+            if _AUDIT_RE.search(text[:150]):  # skip audit report pages
+                continue
+            if _matches_near_top(text, body_patterns_list):
+                start_page_idx = idx
+                break
+
+        # Find end page using stop patterns
+        stop_body_patterns: list[str] = section_config.get("stop_body_patterns", []) if section_key in SECTION_TYPES else []
+        end_page_idx = outer_end
+        if stop_body_patterns:
+            for page in pages:
+                idx = int(page["page_idx"])
+                if idx <= start_page_idx or idx > outer_end:
+                    continue
+                text = str(page.get("text") or "")
+                if _matches_near_top(text, stop_body_patterns):
+                    end_page_idx = idx - 1
+                    break
+        fallback_used = True
+
+    if args.max_pages and (end_page_idx - start_page_idx + 1) > args.max_pages:
+        end_page_idx = start_page_idx + args.max_pages - 1
+
+    # Build slim output
+    chunks: list[str] = []
+    for idx in range(start_page_idx, end_page_idx + 1):
+        page = pages_map.get(idx)
+        if page is None:
+            continue
+        clean = _clean_page_for_llm(page, footer_noise)
+        if clean:
+            chunks.append(f"<!-- page: {idx} -->\n{clean}")
+
+    output_text = "\n\n---\n\n".join(chunks)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    section_slug = section_key.replace("-", "_")
+    output_path = output_dir / f"{artifact_prefix}.slim.{section_slug}.md"
+    output_path.write_text(output_text, encoding="utf-8")
+
+    est_tokens = int(len(output_text) / 1.5)
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "section": section_key,
+                "matched_toc_entries": [e["title"] for e in matched] if matched else [],
+                "fallback_body_scan": fallback_used,
+                "page_range": {"start": start_page_idx, "end": end_page_idx},
+                "pages_included": end_page_idx - start_page_idx + 1,
+                "output": str(output_path),
+                "chars": len(output_text),
+                "est_tokens": est_tokens,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def _infer_note_window(
@@ -1774,6 +2090,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of pages of context to include on each side of a hit (default: 1).",
     )
     slim_parser.set_defaults(func=slim_for_llm)
+
+    # ------------------------------------------------------------------
+    # toc-scan: parse TOC and output toc.json with page-range info
+    # ------------------------------------------------------------------
+    toc_parser = subparsers.add_parser(
+        "toc-scan",
+        help="Parse the annual report TOC and output a toc.json with page-range for every section.",
+    )
+    toc_parser.add_argument("--pages-json", required=True, help="Path to pages.json.")
+    toc_parser.add_argument("--output-dir", required=True, help="Directory for toc.json.")
+    toc_parser.set_defaults(func=toc_scan)
+
+    # ------------------------------------------------------------------
+    # section-slim: TOC-driven extraction of a named section → slim.md
+    # No keyword scoring; page range comes directly from toc.json.
+    # ------------------------------------------------------------------
+    section_choices = sorted(SECTION_TYPES)
+    section_parser = subparsers.add_parser(
+        "section-slim",
+        help="Extract a named section via TOC lookup and output a slim LLM-ready markdown.",
+    )
+    section_parser.add_argument("--pages-json", required=True, help="Path to pages.json.")
+    section_parser.add_argument("--output-dir", required=True)
+    section_parser.add_argument(
+        "--section",
+        required=True,
+        help=(
+            f"Section to extract. Built-in choices: {section_choices}. "
+            "Or pass any substring of a TOC entry title for a direct match."
+        ),
+    )
+    section_parser.add_argument(
+        "--toc-json",
+        default=None,
+        help="Path to toc.json from toc-scan. If omitted, TOC is parsed on the fly.",
+    )
+    section_parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=None,
+        help="Cap the section at this many pages (useful for very long financial-notes).",
+    )
+    section_parser.set_defaults(func=section_slim)
 
     return parser
 
