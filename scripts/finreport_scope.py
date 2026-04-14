@@ -544,6 +544,145 @@ def _find_first_page_index_by_patterns(
     return matches[0] if matches else None
 
 
+def _parse_html_table_grid(table_html: str) -> list[list[dict[str, Any]]]:
+    class TableParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[list[dict[str, Any]]] = []
+            self._in_row = False
+            self._in_cell = False
+            self._current_row: list[dict[str, Any]] = []
+            self._current_cell: dict[str, Any] | None = None
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attrs_map = dict(attrs)
+            if tag == "tr":
+                self._in_row = True
+                self._current_row = []
+                return
+            if tag in {"td", "th"} and self._in_row:
+                self._in_cell = True
+                self._current_cell = {
+                    "text": "",
+                    "rowspan": max(1, int(attrs_map.get("rowspan") or "1")),
+                    "colspan": max(1, int(attrs_map.get("colspan") or "1")),
+                    "is_header": tag == "th",
+                }
+                return
+            if self._in_cell and tag == "br" and self._current_cell is not None:
+                self._current_cell["text"] += "\n"
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in {"td", "th"} and self._in_cell and self._current_cell is not None:
+                self._current_cell["text"] = _clean_special_symbols(
+                    html.unescape(self._current_cell["text"]).strip()
+                )
+                self._current_row.append(self._current_cell)
+                self._current_cell = None
+                self._in_cell = False
+                return
+            if tag == "tr" and self._in_row:
+                if self._current_row:
+                    self.rows.append(self._current_row)
+                self._current_row = []
+                self._in_row = False
+
+        def handle_data(self, data: str) -> None:
+            if self._in_cell and self._current_cell is not None:
+                self._current_cell["text"] += data
+
+    parser = TableParser()
+    parser.feed(table_html)
+    if not parser.rows:
+        return []
+
+    grid: list[list[dict[str, Any]]] = []
+    spans: dict[int, tuple[dict[str, Any], int]] = {}
+    max_cols = 0
+
+    for row_cells in parser.rows:
+        row: list[dict[str, Any]] = []
+        col_idx = 0
+
+        def flush_spans() -> None:
+            nonlocal col_idx
+            while col_idx in spans:
+                anchor, remaining = spans[col_idx]
+                row.append({
+                    "text": "",
+                    "rowspan": anchor["rowspan"],
+                    "colspan": anchor["colspan"],
+                    "is_header": anchor["is_header"],
+                    "is_anchor": False,
+                })
+                if remaining <= 1:
+                    del spans[col_idx]
+                else:
+                    spans[col_idx] = (anchor, remaining - 1)
+                col_idx += 1
+
+        flush_spans()
+        for cell in row_cells:
+            flush_spans()
+            text = str(cell["text"])
+            colspan = int(cell["colspan"])
+            rowspan = int(cell["rowspan"])
+            anchor = {
+                "text": text,
+                "rowspan": rowspan,
+                "colspan": colspan,
+                "is_header": bool(cell["is_header"]),
+                "is_anchor": True,
+            }
+            row.append(anchor)
+            if rowspan > 1:
+                spans[col_idx] = (anchor, rowspan - 1)
+            for offset in range(1, colspan):
+                row.append({
+                    "text": "",
+                    "rowspan": rowspan,
+                    "colspan": colspan,
+                    "is_header": bool(cell["is_header"]),
+                    "is_anchor": False,
+                })
+                if rowspan > 1:
+                    spans[col_idx + offset] = (anchor, rowspan - 1)
+            col_idx += colspan
+            flush_spans()
+        flush_spans()
+        max_cols = max(max_cols, len(row))
+        grid.append(row)
+
+    if max_cols == 0:
+        return []
+
+    padded: list[list[dict[str, Any]]] = []
+    for row in grid:
+        if len(row) < max_cols:
+            row = row + [
+                {
+                    "text": "",
+                    "rowspan": 1,
+                    "colspan": 1,
+                    "is_header": False,
+                    "is_anchor": True,
+                }
+                for _ in range(max_cols - len(row))
+            ]
+        padded.append(row)
+    return padded
+
+
+def _extract_tables_from_text(text: str) -> list[list[list[str]]]:
+    tables: list[list[list[str]]] = []
+    for match in re.finditer(r"<table.*?</table>", str(text or ""), flags=re.DOTALL | re.IGNORECASE):
+        grid = _parse_html_table_grid(match.group(0))
+        if not grid:
+            continue
+        tables.append([[str(cell["text"]).strip() for cell in row] for row in grid])
+    return tables
+
+
 def _find_toc_entries(pages: list[dict[str, Any]], max_page_idx: int = 20) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for page in pages:
@@ -1477,104 +1616,119 @@ def extract_theme_hits(args: argparse.Namespace) -> None:
 def _html_table_to_markdown(table_html: str) -> str:
     """Convert an HTML table to standard Markdown table format."""
 
-    class TableParser(HTMLParser):
-        def __init__(self) -> None:
-            super().__init__()
-            self.rows: list[list[dict[str, Any]]] = []
-            self._in_row = False
-            self._in_cell = False
-            self._current_row: list[dict[str, Any]] = []
-            self._current_cell: dict[str, Any] | None = None
+    def normalize_pipe_cell(text: str) -> str:
+        normalized = str(text or "").replace("|", "\\|")
+        normalized = re.sub(r"\s*\n\s*", " / ", normalized)
+        normalized = re.sub(r"\s{2,}", " ", normalized)
+        return normalized.strip()
 
-        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-            attrs_map = dict(attrs)
-            if tag == "tr":
-                self._in_row = True
-                self._current_row = []
-                return
-            if tag in {"td", "th"} and self._in_row:
-                self._in_cell = True
-                self._current_cell = {
-                    "text": "",
-                    "rowspan": max(1, int(attrs_map.get("rowspan") or "1")),
-                    "colspan": max(1, int(attrs_map.get("colspan") or "1")),
-                    "is_header": tag == "th",
-                }
-                return
-            if self._in_cell and tag == "br" and self._current_cell is not None:
-                self._current_cell["text"] += "\n"
+    def is_value_like(text: str) -> bool:
+        candidate = text.strip().replace(",", "")
+        if not candidate:
+            return False
+        if candidate in {"-", "—"}:
+            return True
+        return bool(re.fullmatch(r"\(?-?\d+(?:\.\d+)?%?\)?", candidate))
 
-        def handle_endtag(self, tag: str) -> None:
-            if tag in {"td", "th"} and self._in_cell and self._current_cell is not None:
-                self._current_cell["text"] = _clean_special_symbols(
-                    html.unescape(self._current_cell["text"]).strip()
-                )
-                self._current_row.append(self._current_cell)
-                self._current_cell = None
-                self._in_cell = False
-                return
-            if tag == "tr" and self._in_row:
-                if self._current_row:
-                    self.rows.append(self._current_row)
-                self._current_row = []
-                self._in_row = False
+    def infer_header_row_count(rows: list[list[dict[str, Any]]], has_merged_cells: bool) -> int:
+        if not rows:
+            return 0
+        if not has_merged_cells or len(rows) == 1:
+            return 1
 
-        def handle_data(self, data: str) -> None:
-            if self._in_cell and self._current_cell is not None:
-                self._current_cell["text"] += data
+        width = len(rows[0])
+        numeric_threshold = max(2, min(width - 1, max(1, width // 2)))
+        for row_idx, row in enumerate(rows):
+            numeric_count = sum(1 for cell in row[1:] if is_value_like(str(cell["text"])))
+            if numeric_count >= numeric_threshold:
+                return max(1, row_idx)
 
-    parser = TableParser()
-    parser.feed(table_html)
-    if not parser.rows:
+        # Most merged-header financial tables use 2 header rows: a super header
+        # (year / category) followed by the real column labels.
+        return max(1, min(2, len(rows) - 1))
+
+    def effective_header_text(row: list[dict[str, Any]], column_idx: int) -> str:
+        cell = row[column_idx]
+        text = str(cell["text"]).strip()
+        if text:
+            return text
+        for left_idx in range(column_idx - 1, -1, -1):
+            candidate = row[left_idx]
+            candidate_text = str(candidate["text"]).strip()
+            if (
+                candidate.get("is_anchor")
+                and candidate_text
+                and left_idx + int(candidate["colspan"]) > column_idx
+            ):
+                return candidate_text
         return ""
 
-    grid: list[list[str]] = []
-    spans: dict[int, tuple[int, str]] = {}
-    max_cols = 0
-
-    for row_cells in parser.rows:
-        row: list[str] = []
-        col_idx = 0
-
-        def flush_spans() -> None:
-            nonlocal col_idx
-            while col_idx in spans:
-                remaining, value = spans[col_idx]
-                row.append(value)
-                if remaining <= 1:
-                    del spans[col_idx]
-                else:
-                    spans[col_idx] = (remaining - 1, value)
-                col_idx += 1
-
-        flush_spans()
-        for cell in row_cells:
-            flush_spans()
-            text = str(cell["text"]).replace("|", "\\|")
-            colspan = int(cell["colspan"])
-            rowspan = int(cell["rowspan"])
-            for offset in range(colspan):
-                value = text if offset == 0 else ""
-                row.append(value)
-                if rowspan > 1:
-                    spans[col_idx] = (rowspan - 1, value)
-                col_idx += 1
-            flush_spans()
-        flush_spans()
-        max_cols = max(max_cols, len(row))
-        grid.append(row)
-
-    if max_cols == 0:
+    padded = _parse_html_table_grid(table_html)
+    if not padded:
         return ""
 
-    padded = [row + [""] * (max_cols - len(row)) for row in grid]
+    max_cols = max(len(row) for row in padded)
+    has_merged_cells = any(
+        int(cell["rowspan"]) > 1 or int(cell["colspan"]) > 1
+        for row in padded
+        for cell in row
+        if cell.get("is_anchor")
+    )
 
     def md_row(cells: list[str]) -> str:
         return "| " + " | ".join(cells) + " |"
 
-    header = padded[0]
+    header_row_count = infer_header_row_count(padded, has_merged_cells)
+    if header_row_count >= len(padded):
+        header_row_count = 1
+
+    super_header: str | None = None
+    if has_merged_cells:
+        header_parts_by_column: list[list[str]] = []
+        for column_idx in range(max_cols):
+            parts: list[str] = []
+            for row_idx in range(header_row_count):
+                text = normalize_pipe_cell(effective_header_text(padded[row_idx], column_idx))
+                if text and (not parts or parts[-1] != text):
+                    parts.append(text)
+            header_parts_by_column.append(parts)
+
+        header = [" / ".join(parts) for parts in header_parts_by_column]
+        body = [
+            [normalize_pipe_cell(str(cell["text"])) for cell in row]
+            for row in padded[header_row_count:]
+        ]
+    else:
+        header = [normalize_pipe_cell(str(cell["text"])) for cell in padded[0]]
+        body = [
+            [normalize_pipe_cell(str(cell["text"])) for cell in row]
+            for row in padded[1:]
+        ]
+
+    if header and not header[0].strip():
+        non_empty_first_col = sum(1 for row in body if row and row[0].strip())
+        if non_empty_first_col >= max(2, len(body) // 3):
+            header[0] = "项目"
+
+    cleaned_body: list[list[str]] = []
+    seen_value_signatures: set[tuple[str, ...]] = set()
+    for row in body:
+        if not any(cell.strip() for cell in row):
+            continue
+        signature = tuple(cell.strip() for cell in row[1:])
+        if not row[0].strip():
+            if not any(signature):
+                continue
+            if signature in seen_value_signatures:
+                continue
+            row = row[:]
+            row[0] = "合计"
+        cleaned_body.append(row)
+        if any(signature):
+            seen_value_signatures.add(signature)
+    body = cleaned_body
+
     separator = "|" + "|".join("---" for _ in range(max_cols)) + "|"
-    body = padded[1:]
 
     def is_section_row(cells: list[str]) -> bool:
         if not cells:
@@ -1603,6 +1757,8 @@ def _html_table_to_markdown(table_html: str) -> str:
         lines = []
         if current_section:
             lines.append(f"**{current_section}**")
+        if super_header:
+            lines.append(f"**{super_header}**")
         lines.append(md_row(header))
         lines.append(separator)
         for row in current_rows:
@@ -1618,7 +1774,17 @@ def _html_table_to_markdown(table_html: str) -> str:
         current_rows.append(row)
 
     flush_current_rows()
-    return "\n\n".join(blocks)
+    if blocks:
+        return "\n\n".join(blocks)
+
+    lines = []
+    if super_header:
+        lines.append(f"**{super_header}**")
+    lines.append(md_row(header))
+    lines.append(separator)
+    for row in body:
+        lines.append(md_row(row))
+    return "\n".join(lines)
 
 
 def _clean_page_for_llm(

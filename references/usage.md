@@ -151,10 +151,15 @@ python scripts/finreport_scope.py section-slim \
 
 slim阶段对每页做四层清洗：
 
-1. **HTML表格→Markdown**：处理colspan/rowspan，分组表拆成小表
+1. **HTML表格→Markdown**：处理colspan/rowspan，分组表拆成小表，多层表头压平成组合列名
 2. **特殊符号清洗**：修复MinerU残留（`$2 9 . 3 \%$` → `29.3%`）
 3. **阅读优化**：清理括号内外多余空格
 4. **页头/页脚噪声过滤**：自动检测公司名、年份、页码并移除
+
+额外规则：
+- 左上角空白表头在大多数财务表中补成 `项目`
+- 空标签汇总行在值列明确时补成 `合计`
+- 与前文完全重复的空标签合计行直接去重
 
 遇到新的脏模式优先补 `_clean_special_symbols()`，页脚问题补 `_is_footer_noise_line()`。
 
@@ -166,4 +171,25 @@ slim阶段对每页做四层清洗：
 | 中国平安 2025 | 39-72 (34p) | 186-188 (3p) | 189-190 (1p) | 62p |
 | 中国人保 2025 | 19-49 (31p) | 126-128 (3p) | 129-131 (3p) | 58p |
 | 中国太保 2025 | 33-62 (30p) | 157-158 (2p) | 159-160 (2p) | 39p |
-| 中国人寿 2024 | 12-25 (14p) | 96-99 (4p) | 100-102 (3p) | 45p |
+| 中国人寿 2025 | 12-26 (15p) | 88-91 (4p) | 92-95 (4p) | 44p |
+
+## 2026-04 校验说明
+
+已对以下5家公司2025年年报做过回归验证：
+- 中国平安
+- 中国人保
+- 中国太保
+- 新华保险
+- 中国人寿
+
+覆盖命令：
+- `toc-scan`
+- `section-slim --section management-discussion`
+- `section-slim --section balance-sheet`
+- `section-slim --section income-statement`
+- `section-slim --section financial-notes --ref-slim ...`
+
+其中：
+- 中国平安主要依赖 HTML 目录定位
+- 中国人保、中国太保、新华保险主表/附注主要依赖正文 fallback 或财务子目录兜底
+- 中国人寿的 TOC 只有“08 财务报告”，三大主表依赖正文 fallback
