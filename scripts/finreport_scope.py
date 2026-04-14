@@ -97,6 +97,100 @@ def _normalize_formula_fragment(fragment: str) -> str:
     return normalized.strip()
 
 
+def _expand_compact_date(match: re.Match[str]) -> str:
+    year = match.group(1)
+    month = int(match.group(2))
+    day = int(match.group(3))
+    return f"{year}年{month}月{day}日"
+
+
+def _clean_residual_ocr_noise(text: str) -> str:
+    cleaned = str(text or "").replace("\uffa0", " ")
+
+    normalized_lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line
+
+        for _ in range(3):
+            prev_line = line
+
+            # Duplicate year fragments are a common OCR residue, e.g.
+            # "新华20252025年是".
+            line = re.sub(r"(?<!\d)(20\d{2})\1年", r"\1年", line)
+
+            # Normalize compact dates both in standalone form and when directly
+            # followed by an amount or page-number residue.
+            line = re.sub(
+                r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?=\d)",
+                lambda m: _expand_compact_date(m) + " ",
+                line,
+            )
+            line = re.sub(
+                r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)",
+                _expand_compact_date,
+                line,
+            )
+
+            # Split compact value sequences that MinerU occasionally glues
+            # together.
+            line = re.sub(
+                r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)(?=20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))",
+                r"\1 / ",
+                line,
+            )
+            line = re.sub(
+                r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)(?=人民币)",
+                r"\1 / ",
+                line,
+            )
+            line = re.sub(
+                r"(\d{1,3}(?:,\d{3})+)(?=\d{1,3}(?:,\d{3})+)",
+                r"\1 / ",
+                line,
+            )
+            line = re.sub(
+                r"(\d{1,3}(?:,\d{3})+)(?=\d{1,3}(?:,\d{3})+\.\d)",
+                r"\1 / ",
+                line,
+            )
+            line = re.sub(
+                r"(\d{1,3}(?:,\d{3})+\.\d+)(?=\d+(?:\.\d+)?%)",
+                r"\1 / ",
+                line,
+            )
+            line = re.sub(
+                r"(\d{1,3}(?:,\d{3})+)(?=(?:\d{1,3}(?:,\d{3})+(?!\d)|\d+(?:\.\d+)?%))",
+                r"\1 / ",
+                line,
+            )
+            line = re.sub(
+                r"(?<!\d)(\d{1,2})\.(\d{3}\.\d{2})(?!\d)",
+                r"\1,\2",
+                line,
+            )
+
+            # Restore separators in glued date/value chains and rate ranges.
+            line = re.sub(r"(?<=日)(?=\d)", " ", line)
+            line = re.sub(
+                r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)(?=20\d{2}年)",
+                r"\1 / ",
+                line,
+            )
+            line = re.sub(r"(?<=%)(?=\d+-\d+年)", " / ", line)
+
+            if line == prev_line:
+                break
+
+        # If a large amount is immediately followed by a short page-number-like
+        # suffix at line end, keep the amount and drop the dangling tail.
+        line = re.sub(r"(?<!\d)(\d{1,3}(?:,\d{3})+)(\d{2,3})$", r"\1", line)
+
+        line = re.sub(r"\s{2,}", " ", line)
+        normalized_lines.append(line)
+
+    return "\n".join(normalized_lines)
+
+
 def _clean_special_symbols(text: str) -> str:
     cleaned = str(text or "")
     cleaned = re.sub(r"\$\s*\\cdot\s*\$", "- ", cleaned)
@@ -107,6 +201,7 @@ def _clean_special_symbols(text: str) -> str:
         flags=re.DOTALL,
     )
     cleaned = _collapse_spaced_number(cleaned)
+    cleaned = _clean_residual_ocr_noise(cleaned)
     cleaned = re.sub(r"\s+([%.,;:])", r"\1", cleaned)
     cleaned = re.sub(r"\(\s+", "(", cleaned)
     cleaned = re.sub(r"\s+\)", ")", cleaned)
@@ -121,6 +216,38 @@ def _polish_readability(text: str) -> str:
         if line.startswith("|") and line.endswith("|"):
             polished_lines.append(line)
             continue
+        line = re.sub(r"\+\s*/\s*-\s*", "+/- ", line)
+        line = re.sub(r"(?<=[\u4e00-\u9fff])\s*/\s*(?=[\u4e00-\u9fff])", "/", line)
+        line = re.sub(
+            r"(\d+(?:\.\d+)?%)\s+(?=\d+(?:\.\d+)?%)",
+            r"\1、",
+            line,
+        )
+        line = re.sub(
+            r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*/\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?%)",
+            r"\1，\2，\3",
+            line,
+        )
+        line = re.sub(
+            r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*/\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?)",
+            r"\1，\2",
+            line,
+        )
+        line = re.sub(
+            r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?%)",
+            r"\1，\2",
+            line,
+        )
+        line = re.sub(
+            r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*/\s*(20\d{2}年)",
+            r"\1，\2",
+            line,
+        )
+        line = re.sub(
+            r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\s*/\s*人民币",
+            r"\1，人民币",
+            line,
+        )
         line = re.sub(r"(?<=\d)%\s+([，。；：])", r"%\1", line)
         line = re.sub(r"(?<=\d)\s+([，。；：])", r"\1", line)
         line = re.sub(r"([（(])\s+", r"\1", line)
