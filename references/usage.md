@@ -23,6 +23,9 @@ PDF → convert → pages.json（永久复用）
                           → .slim.balance_sheet.md
                           → .slim.income_statement.md
                           → .slim.financial_notes.md（按科目筛选）
+                  ↓
+             statement-notes → .slim.balance_sheet_with_notes.md
+                             → .slim.income_statement_with_notes.md
 ```
 
 ## 偿付能力报告工作流
@@ -87,6 +90,13 @@ python scripts/finreport_scope.py section-slim \
 # 财务报表附注（按科目筛选）
 ... --section financial-notes \
   --ref-slim "<stem>.slim.balance_sheet.md" "<stem>.slim.income_statement.md"
+
+# 主表 + 对应附注组合文档
+python scripts/finreport_scope.py statement-notes \
+  --balance-sheet-slim "<stem>.slim.balance_sheet.md" \
+  --income-statement-slim "<stem>.slim.income_statement.md" \
+  --financial-notes-slim "<stem>.slim.financial_notes.md" \
+  --output-dir "<output_dir>"
 ```
 
 ### section-slim 的定位逻辑
@@ -106,6 +116,21 @@ python scripts/finreport_scope.py section-slim \
 1. 提取主节编号（"附注六"→六，"附注十一"→十一）和子项编号（表格中的1、2、3...）
 2. 在附注全文中只保留匹配子项的页面
 3. 新华保险等无主节编号的报告，用第一个资产负债表科目的编号作为起始阈值
+
+### 主表+附注组合逻辑（statement-notes）
+
+`statement-notes` 读取三份已生成的 slim 文档：
+
+1. 从资产负债表 / 利润表 Markdown 表格里解析附注列，按主表顺序提取引用编号
+2. 按附注编号、附注子项（如 `31(5)` / `57(1)`）和金额回财务报表附注中定位内容
+3. 生成两个新文档：
+   - `<stem>.slim.balance_sheet_with_notes.md`
+   - `<stem>.slim.income_statement_with_notes.md`
+
+当前策略优先保证五家上市险企 2025 年报可用：
+- 优先用明确的附注标题切块
+- 标题缺失时，用主表科目名和主表金额回附注中补匹配
+- 同一附注号对应多个主表科目时，在组合文档中合并展示并列出对应科目
 
 ## 按主题关键词筛选（辅助流程）
 
@@ -143,6 +168,8 @@ python scripts/finreport_scope.py section-slim \
   <stem>.slim.balance_sheet.md          # ★ 资产负债表
   <stem>.slim.income_statement.md       # ★ 利润表
   <stem>.slim.financial_notes.md        # ★ 附注（筛选后）
+  <stem>.slim.balance_sheet_with_notes.md      # ★ 资产负债表+对应附注
+  <stem>.slim.income_statement_with_notes.md   # ★ 利润表+对应附注
 ```
 
 带 ★ 的文件直接提供给LLM。
@@ -189,8 +216,11 @@ slim阶段对每页做四层清洗：
 - `section-slim --section balance-sheet`
 - `section-slim --section income-statement`
 - `section-slim --section financial-notes --ref-slim ...`
+- `statement-notes`
 
 其中：
 - 中国平安主要依赖 HTML 目录定位
 - 中国人保、中国太保、新华保险主表/附注主要依赖正文 fallback 或财务子目录兜底
 - 中国人寿的 TOC 只有“08 财务报告”，三大主表依赖正文 fallback
+
+`statement-notes` 在五家公司上均已跑通。少量主表科目如果在 `financial_notes` 输入文档中未被保留，或附注标题本身缺失且金额也无法稳定回配时，会在输出中保留“建议人工复核”提示，而不会静默跳过。

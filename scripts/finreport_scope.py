@@ -56,6 +56,24 @@ class ThemeHit:
     excerpt: str
 
 
+@dataclass
+class StatementNoteRef:
+    order: int
+    item_name: str
+    note_key: str
+    note_no: int
+    note_subref: str | None
+    current_amount: str | None
+    prior_amount: str | None
+
+
+@dataclass
+class NoteBlock:
+    block_id: int
+    page_idx: int
+    text: str
+
+
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -1437,6 +1455,476 @@ def section_slim(args: argparse.Namespace) -> None:
     )
 
 
+_MD_PAGE_RE = re.compile(r"(?m)^<!-- page: (\d+) -->\s*$")
+_MD_NOTE_HEADING_RE = re.compile(r"^\s*(\d{1,2})(?:[\.、]|\s+)([^\n]{1,80})$")
+_MD_SUBSECTION_RE = re.compile(r"^\s*[（(](\d{1,2})[）)]\s*(.+)?$")
+_MD_TABLE_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
+
+
+def _derive_statement_artifact_prefix(path: Path) -> str:
+    name = path.name
+    for suffix in [
+        ".slim.balance_sheet.md",
+        ".slim.income_statement.md",
+        ".slim.financial_notes.md",
+    ]:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return _derive_artifact_prefix(path)
+
+
+def _split_markdown_pages(text: str) -> list[tuple[int, str]]:
+    matches = list(_MD_PAGE_RE.finditer(str(text or "")))
+    if not matches:
+        return []
+
+    pages: list[tuple[int, str]] = []
+    for idx, match in enumerate(matches):
+        page_idx = int(match.group(1))
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        page_text = text[start:end].strip()
+        if page_text:
+            pages.append((page_idx, page_text))
+    return pages
+
+
+def _split_markdown_blocks(page_text: str) -> list[str]:
+    return [block.strip() for block in re.split(r"\n{2,}", str(page_text or "")) if block.strip()]
+
+
+def _parse_markdown_table_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return []
+    return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+
+def _is_markdown_separator_row(cells: list[str]) -> bool:
+    if not cells:
+        return False
+    return all(_MD_TABLE_SEPARATOR_RE.fullmatch(cell or "") for cell in cells)
+
+
+def _clean_statement_item_name(name: str) -> str:
+    cleaned = str(name or "").strip().strip("*")
+    cleaned = re.sub(r"^(?:其中|加|减)\s*[:：]\s*", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_lookup_text(text: str) -> str:
+    normalized = _clean_note_text(str(text or ""))
+    normalized = normalized.replace("（", "(").replace("）", ")")
+    normalized = re.sub(r"[：:\-·•,，。；;、\s]+", "", normalized)
+    return normalized.lower()
+
+
+def _build_item_search_terms(item_name: str) -> list[str]:
+    base = _clean_statement_item_name(item_name)
+    candidates = [base]
+    no_paren = re.sub(r"[（(][^()（）]{0,40}[)）]", "", base).strip()
+    if no_paren and no_paren != base:
+        candidates.append(no_paren)
+    normalized: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip("：: ")
+        if candidate and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
+
+
+def _parse_note_reference(cell_text: str) -> tuple[str, int, str | None] | None:
+    raw = str(cell_text or "").strip()
+    if not raw:
+        return None
+    consolidated = raw.split("/")[0].strip()
+    match = re.match(r"(\d{1,2})(?:\s*[（(](\d{1,2})[）)])?", consolidated)
+    if not match:
+        return None
+    note_no = int(match.group(1))
+    note_subref = match.group(2)
+    note_key = f"{note_no}({note_subref})" if note_subref else str(note_no)
+    return note_key, note_no, note_subref
+
+
+def _extract_statement_note_refs(statement_text: str) -> list[StatementNoteRef]:
+    refs: list[StatementNoteRef] = []
+    order = 0
+    lines = str(statement_text or "").splitlines()
+    idx = 0
+    while idx < len(lines):
+        if not lines[idx].strip().startswith("|"):
+            idx += 1
+            continue
+
+        start = idx
+        while idx < len(lines) and lines[idx].strip().startswith("|"):
+            idx += 1
+        table_lines = lines[start:idx]
+        rows = [_parse_markdown_table_cells(line) for line in table_lines]
+        separator_idx = next((row_idx for row_idx, row in enumerate(rows) if _is_markdown_separator_row(row)), None)
+        if separator_idx is None:
+            continue
+
+        note_col_idx: int | None = None
+        for row in rows[: min(len(rows), separator_idx + 3)]:
+            for col_idx, cell in enumerate(row):
+                if "附注" in cell:
+                    note_col_idx = col_idx
+                    break
+            if note_col_idx is not None:
+                break
+        if note_col_idx is None:
+            continue
+
+        for row in rows[separator_idx + 1 :]:
+            if not row or note_col_idx >= len(row):
+                continue
+            item_name = _clean_statement_item_name(row[0] if row else "")
+            if not item_name:
+                continue
+
+            parsed_ref = _parse_note_reference(row[note_col_idx])
+            if not parsed_ref:
+                continue
+
+            current_amount = row[note_col_idx + 1].strip() if note_col_idx + 1 < len(row) else None
+            prior_amount = row[note_col_idx + 2].strip() if note_col_idx + 2 < len(row) else None
+            refs.append(
+                StatementNoteRef(
+                    order=order,
+                    item_name=item_name,
+                    note_key=parsed_ref[0],
+                    note_no=parsed_ref[1],
+                    note_subref=parsed_ref[2],
+                    current_amount=current_amount or None,
+                    prior_amount=prior_amount or None,
+                )
+            )
+            order += 1
+    return refs
+
+
+def _group_statement_refs(refs: list[StatementNoteRef]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for ref in refs:
+        group = grouped.get(ref.note_key)
+        if group is None:
+            group = {
+                "note_key": ref.note_key,
+                "note_no": ref.note_no,
+                "note_subref": ref.note_subref,
+                "order": ref.order,
+                "items": [],
+                "terms": [],
+                "amounts": [],
+            }
+            grouped[ref.note_key] = group
+
+        if ref.item_name not in group["items"]:
+            group["items"].append(ref.item_name)
+        for term in _build_item_search_terms(ref.item_name):
+            if term not in group["terms"]:
+                group["terms"].append(term)
+        for amount in (ref.current_amount, ref.prior_amount):
+            if amount and amount not in {"-", "–", "—"} and amount not in group["amounts"]:
+                group["amounts"].append(amount)
+
+    return sorted(grouped.values(), key=lambda item: item["order"])
+
+
+def _find_note_heading_in_block(block: str, max_lines: int = 8) -> tuple[int, str, int] | None:
+    lines = [line.strip() for line in str(block or "").splitlines()[:max_lines]]
+    for idx, line in enumerate(lines):
+        if not line or line.startswith("|") or line.startswith("**"):
+            continue
+        match = _MD_NOTE_HEADING_RE.match(line)
+        if not match:
+            continue
+        title = re.sub(r"\s*[（(]续[）)]\s*$", "", match.group(2)).strip()
+        if not title or len(title) > 80:
+            continue
+        return int(match.group(1)), title, idx
+    return None
+
+
+def _detect_note_heading(block: str) -> tuple[int, str] | None:
+    found = _find_note_heading_in_block(block)
+    if found is None:
+        return None
+    return found[0], found[1]
+
+
+def _parse_notes_blocks(
+    notes_text: str,
+    initial_note_no: int | None,
+) -> tuple[dict[int, dict[str, Any]], list[NoteBlock]]:
+    note_map: dict[int, dict[str, Any]] = {}
+    unassigned: list[NoteBlock] = []
+    pages = _split_markdown_pages(notes_text)
+    if not pages:
+        return note_map, unassigned
+
+    first_page_idx = pages[0][0]
+    seen_explicit = False
+    current_note_no: int | None = None
+    block_id = 0
+
+    def push_note_block(note_no: int, page_idx: int, block_text: str, title: str | None = None) -> None:
+        nonlocal block_id
+        note_entry = note_map.setdefault(note_no, {"title": title, "blocks": []})
+        if title and not note_entry.get("title"):
+            note_entry["title"] = title
+        note_entry["blocks"].append(
+            NoteBlock(block_id=block_id, page_idx=page_idx, text=block_text.strip())
+        )
+        block_id += 1
+
+    def push_unassigned(page_idx: int, block_text: str) -> None:
+        nonlocal block_id
+        unassigned.append(NoteBlock(block_id=block_id, page_idx=page_idx, text=block_text.strip()))
+        block_id += 1
+
+    for page_idx, page_text in pages:
+        blocks = _split_markdown_blocks(page_text)
+        explicit_positions: list[tuple[int, int, str]] = []
+        for pos, block in enumerate(blocks):
+            heading = _detect_note_heading(block)
+            if heading is not None:
+                explicit_positions.append((pos, heading[0], heading[1]))
+
+        if explicit_positions:
+            first_explicit_pos = explicit_positions[0][0]
+            if first_explicit_pos > 0:
+                target_note = None
+                if seen_explicit and current_note_no is not None:
+                    target_note = current_note_no
+                elif not seen_explicit and page_idx == first_page_idx and initial_note_no is not None:
+                    target_note = initial_note_no
+                for block in blocks[:first_explicit_pos]:
+                    if target_note is not None:
+                        push_note_block(target_note, page_idx, block)
+                    else:
+                        push_unassigned(page_idx, block)
+
+            for pos_idx, (start_pos, note_no, title) in enumerate(explicit_positions):
+                end_pos = (
+                    explicit_positions[pos_idx + 1][0]
+                    if pos_idx + 1 < len(explicit_positions)
+                    else len(blocks)
+                )
+                for block in blocks[start_pos:end_pos]:
+                    push_note_block(note_no, page_idx, block, title=title)
+            current_note_no = explicit_positions[-1][1]
+            seen_explicit = True
+            continue
+
+        target_note = None
+        if not seen_explicit and page_idx == first_page_idx and initial_note_no is not None:
+            target_note = initial_note_no
+
+        for block in blocks:
+            if target_note is not None:
+                push_note_block(target_note, page_idx, block)
+            else:
+                push_unassigned(page_idx, block)
+
+    return note_map, unassigned
+
+
+def _score_note_block(block: NoteBlock, terms: list[str], amounts: list[str]) -> int:
+    score = 0
+    normalized_block = _normalize_lookup_text(block.text)
+    for term in terms:
+        normalized_term = _normalize_lookup_text(term)
+        if normalized_term and normalized_term in normalized_block:
+            score = max(score, 12 + min(len(normalized_term), 12))
+    for amount in amounts:
+        if amount and amount in block.text:
+            score += 4
+    return score
+
+
+def _slice_note_subsection_blocks(
+    blocks: list[NoteBlock],
+    note_subref: str | None,
+) -> tuple[list[NoteBlock], str | None]:
+    if not blocks or not note_subref:
+        return blocks, None
+
+    subsection_blocks: list[NoteBlock] = []
+    subsection_title: str | None = None
+    current_subref: str | None = None
+    seen_subsection = False
+
+    for block in blocks:
+        lines = [line.strip() for line in block.text.splitlines()[:8] if line.strip()]
+        for line in lines:
+            match = _MD_SUBSECTION_RE.match(line)
+            if not match:
+                continue
+            current_subref = match.group(1)
+            if current_subref == note_subref:
+                subsection_title = (match.group(2) or "").strip() or None
+                seen_subsection = True
+            break
+        if current_subref == note_subref:
+            subsection_blocks.append(block)
+
+    if not seen_subsection or not subsection_blocks:
+        return blocks, None
+
+    result: list[NoteBlock] = []
+    main_heading = _detect_note_heading(blocks[0].text)
+    if main_heading is not None:
+        result.append(blocks[0])
+    for block in subsection_blocks:
+        if all(existing.block_id != block.block_id for existing in result):
+            result.append(block)
+    return result, subsection_title
+
+
+def _merge_note_blocks(blocks: list[NoteBlock]) -> list[NoteBlock]:
+    merged: list[NoteBlock] = []
+    seen_ids: set[int] = set()
+    for block in sorted(blocks, key=lambda item: item.block_id):
+        if block.block_id in seen_ids:
+            continue
+        seen_ids.add(block.block_id)
+        merged.append(block)
+    return merged
+
+
+def _render_note_blocks(blocks: list[NoteBlock]) -> str:
+    rendered: list[str] = []
+    current_page_idx: int | None = None
+    for block in blocks:
+        if block.page_idx != current_page_idx:
+            rendered.append(f"<!-- page: {block.page_idx} -->")
+            current_page_idx = block.page_idx
+        rendered.append(block.text)
+    return "\n\n".join(rendered).strip()
+
+
+def _build_statement_with_notes_output(
+    *,
+    statement_title: str,
+    statement_text: str,
+    refs: list[StatementNoteRef],
+    note_map: dict[int, dict[str, Any]],
+    unassigned_blocks: list[NoteBlock],
+) -> tuple[str, dict[str, int]]:
+    note_groups = _group_statement_refs(refs)
+    lines = [
+        f"# {statement_title}及对应财务报表附注",
+        "",
+        "## 原始主表",
+        "",
+        statement_text.strip(),
+        "",
+        "## 对应附注",
+    ]
+
+    matched_groups = 0
+    unmatched_groups = 0
+
+    for group in note_groups:
+        note_entry = note_map.get(group["note_no"]) or {}
+        note_blocks = list(note_entry.get("blocks") or [])
+        note_title = note_entry.get("title") or (group["items"][0] if group["items"] else "")
+        scoped_blocks, sub_title = _slice_note_subsection_blocks(note_blocks, group["note_subref"])
+        if sub_title:
+            note_title = sub_title
+
+        extra_blocks = [
+            block
+            for block in unassigned_blocks
+            if _score_note_block(block, group["terms"], group["amounts"]) >= 8
+        ]
+        merged_blocks = _merge_note_blocks(scoped_blocks + extra_blocks)
+
+        lines.extend(
+            [
+                "",
+                f"### 附注 {group['note_key']}" + (f" {note_title}" if note_title else ""),
+                "",
+                f"对应主表科目：{'；'.join(group['items'])}",
+            ]
+        )
+
+        if merged_blocks:
+            matched_groups += 1
+            lines.extend(["", _render_note_blocks(merged_blocks)])
+        else:
+            unmatched_groups += 1
+            lines.extend(["", "未在财务报表附注中定位到明确内容，建议人工复核。"])
+
+    output_text = "\n".join(lines).strip() + "\n"
+    return output_text, {
+        "statement_refs": len(note_groups),
+        "matched_refs": matched_groups,
+        "unmatched_refs": unmatched_groups,
+    }
+
+
+def statement_notes(args: argparse.Namespace) -> None:
+    balance_sheet_path = Path(args.balance_sheet_slim).expanduser().resolve()
+    income_statement_path = Path(args.income_statement_slim).expanduser().resolve()
+    financial_notes_path = Path(args.financial_notes_slim).expanduser().resolve()
+
+    balance_sheet_text = balance_sheet_path.read_text(encoding="utf-8")
+    income_statement_text = income_statement_path.read_text(encoding="utf-8")
+    financial_notes_text = financial_notes_path.read_text(encoding="utf-8")
+
+    balance_sheet_refs = _extract_statement_note_refs(balance_sheet_text)
+    income_statement_refs = _extract_statement_note_refs(income_statement_text)
+    all_refs = balance_sheet_refs + income_statement_refs
+    initial_note_no = min((ref.note_no for ref in all_refs), default=None)
+
+    note_map, unassigned_blocks = _parse_notes_blocks(financial_notes_text, initial_note_no)
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_prefix = _derive_statement_artifact_prefix(balance_sheet_path)
+
+    balance_sheet_output, balance_stats = _build_statement_with_notes_output(
+        statement_title="合并资产负债表",
+        statement_text=balance_sheet_text,
+        refs=balance_sheet_refs,
+        note_map=note_map,
+        unassigned_blocks=unassigned_blocks,
+    )
+    balance_output_path = output_dir / f"{artifact_prefix}.slim.balance_sheet_with_notes.md"
+    balance_output_path.write_text(balance_sheet_output, encoding="utf-8")
+
+    income_statement_output, income_stats = _build_statement_with_notes_output(
+        statement_title="合并利润表",
+        statement_text=income_statement_text,
+        refs=income_statement_refs,
+        note_map=note_map,
+        unassigned_blocks=unassigned_blocks,
+    )
+    income_output_path = output_dir / f"{artifact_prefix}.slim.income_statement_with_notes.md"
+    income_output_path.write_text(income_statement_output, encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "balance_sheet_with_notes": str(balance_output_path),
+                "income_statement_with_notes": str(income_output_path),
+                "balance_sheet_stats": balance_stats,
+                "income_statement_stats": income_stats,
+                "note_blocks": sum(len(item.get("blocks") or []) for item in note_map.values()),
+                "unassigned_blocks": len(unassigned_blocks),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def _infer_note_window(
     pages: list[dict[str, Any]],
     theme_config: dict[str, Any],
@@ -2239,6 +2727,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     section_parser.set_defaults(func=section_slim)
+
+    statement_notes_parser = subparsers.add_parser(
+        "statement-notes",
+        help="Compose balance-sheet / income-statement docs with their matched financial notes.",
+    )
+    statement_notes_parser.add_argument("--balance-sheet-slim", required=True)
+    statement_notes_parser.add_argument("--income-statement-slim", required=True)
+    statement_notes_parser.add_argument("--financial-notes-slim", required=True)
+    statement_notes_parser.add_argument("--output-dir", required=True)
+    statement_notes_parser.set_defaults(func=statement_notes)
 
     return parser
 
